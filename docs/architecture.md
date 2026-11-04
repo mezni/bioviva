@@ -1,1069 +1,989 @@
-# Architecture — llm-gateway
+# LLM Gateway — System Architecture
 
-**Project:** llm-gateway  
-**Document:** System Architecture  
-**Version:** 1.0  
+**Version:** 1.1  
 **Status:** Draft  
-**Architecture Style:** Clean Architecture + Event-Driven Architecture  
-**Primary Language:** Rust  
-**Evaluation Service:** Python
+**Architecture style:** Clean Architecture + Event-Driven Architecture  
+**Primary language:** Rust  
+**Evaluation services:** Python
 
 ---
 
-# 1. Architecture Overview
+## 1. Architecture Goals
 
-## 1.1 Purpose
+The LLM Gateway is a provider-independent infrastructure platform that centralizes access to LLM providers.
 
-This document defines the technical architecture of `llm-gateway`.
+It must provide:
 
-It establishes:
+- Unified API for multiple LLM providers.
+- Secure authentication and authorization.
+- Tenant isolation and access control.
+- Distributed rate limiting and concurrency control.
+- Financial budget enforcement and usage accounting.
+- Secure provider credential management.
+- Intelligent model routing.
+- Provider resilience and fallback.
+- Exact and semantic caching.
+- Centralized observability and audit trails.
+- Asynchronous evaluation and quality monitoring.
 
-- System boundaries.
-- Architectural style.
-- Core components.
-- Component responsibilities.
-- Data flows.
-- Integration patterns.
-- Technology decisions.
-- Deployment architecture.
-- Reliability and security principles.
+### Architecture principles
 
-The architecture provides a foundation for implementing the product requirements defined in `product.md`.
-
-## 1.2 Architectural Goals
-
-The architecture must:
-
-1. Decouple applications from LLM providers.
-2. Centralize inference governance.
-3. Support intelligent model routing.
-4. Enforce tenant-level financial controls.
-5. Provide reliable provider integrations.
-6. Capture distributed inference telemetry.
-7. Support asynchronous evaluation.
-8. Scale horizontally.
-9. Maintain clear separation of concerns.
-10. Support additional providers and capabilities without modifying core business logic.
-
-## 1.3 Architectural Principles
-
-| Principle | Description |
-|---|---|
-| Clean Architecture | Business rules independent of infrastructure |
-| Domain-Driven Design | Explicit domain models and business invariants |
-| Dependency Inversion | Core depends on abstractions |
-| Provider Independence | Provider-specific logic isolated in adapters |
-| Policy-Driven Design | Routing and governance controlled by policies |
-| Event-Driven Architecture | Asynchronous telemetry and evaluation |
-| Fail-Safe Defaults | Security and budget controls default to restrictive behavior |
-| Observability by Design | Every inference execution is traceable |
-| Idempotency | Financial and event processing operations are safe to repeat |
-| Extensibility | New providers and evaluation methods require minimal changes |
+1. Security before inference.
+2. Policy enforcement before provider execution.
+3. Financial controls must be atomic and auditable.
+4. Provider integrations must be replaceable.
+5. Inference must not depend on asynchronous evaluation.
+6. PostgreSQL is the source of truth for durable business data.
+7. Redis supports distributed, low-latency operational controls.
+8. Every routing decision must be explainable.
+9. Secrets must never be exposed through application logs or API responses.
+10. Infrastructure concerns must remain outside domain logic.
 
 ---
 
-# 2. System Context
-
-## 2.1 System Context Diagram
+## 2. System Context
 
 ```mermaid
 flowchart TB
-    subgraph Consumers["Application Layer"]
-        APP1["AI Applications"]
-        APP2["Multi-Agent Systems"]
-        APP3["Internal Services"]
+    APP["AI Applications"]
+    ADMIN["Platform Administrators"]
+    CLIENT["SDK / API Client"]
+
+    subgraph GATEWAY["LLM Gateway — Rust"]
+        API["API Gateway"]
+        SECURITY["Identity & Security"]
+        POLICY["Policy & Admission"]
+        ROUTER["Model Router"]
+        PROVIDERS["Provider Adapters"]
     end
 
-    GW["LLM Gateway<br/>Rust / Axum"]
+    subgraph INFRA["Infrastructure"]
+        PG[("PostgreSQL")]
+        REDIS[("Redis")]
+        SECRETS["Secret Manager"]
+        BROKER["Event Broker"]
+    end
 
-    subgraph External["External AI Providers"]
+    subgraph EXTERNAL["External LLM Providers"]
         OPENAI["OpenAI"]
         ANTHROPIC["Anthropic"]
-        VLLM["vLLM"]
-        OLLAMA["Ollama"]
+        LOCAL["vLLM / Ollama"]
     end
 
-    subgraph Platform["Platform Infrastructure"]
-        PG["PostgreSQL"]
-        REDIS["Redis"]
-        QUEUE["Event Transport"]
+    subgraph OBS["Observability & Evaluation"]
         OTEL["OpenTelemetry"]
-    end
-
-    subgraph Observability["Observability & Evaluation"]
-        LF["Langfuse"]
-        GRAFANA["Prometheus / Grafana"]
+        LANGFUSE["Langfuse"]
         EVAL["Python Evaluation Worker"]
+        PROM["Prometheus / Grafana"]
     end
 
-    APP1 --> GW
-    APP2 --> GW
-    APP3 --> GW
+    APP --> CLIENT
+    CLIENT --> API
+    ADMIN --> API
 
-    GW --> OPENAI
-    GW --> ANTHROPIC
-    GW --> VLLM
-    GW --> OLLAMA
+    API --> SECURITY
+    SECURITY --> POLICY
+    POLICY --> ROUTER
+    ROUTER --> PROVIDERS
 
-    GW --> PG
-    GW --> REDIS
-    GW --> QUEUE
-    GW --> OTEL
+    SECURITY --> PG
+    POLICY --> REDIS
+    POLICY --> PG
+    PROVIDERS --> SECRETS
 
-    QUEUE --> EVAL
-    OTEL --> LF
-    OTEL --> GRAFANA
-    EVAL --> LF
+    PROVIDERS --> OPENAI
+    PROVIDERS --> ANTHROPIC
+    PROVIDERS --> LOCAL
+
+    API --> BROKER
+    PROVIDERS --> BROKER
+    BROKER --> EVAL
+
+    API --> OTEL
+    PROVIDERS --> OTEL
+    OTEL --> LANGFUSE
+    OTEL --> PROM
+
     EVAL --> PG
 ```
 
-## 2.2 External Actors
+---
 
-| Actor | Interaction |
+## 3. Architectural Style
+
+The system uses two complementary architectural patterns.
+
+### 3.1 Clean Architecture
+
+The application is organized into four logical layers:
+
+| Layer | Responsibility |
 |---|---|
-| AI Application | Sends inference requests |
-| Multi-Agent System | Sends inference and tool-related requests |
-| Tenant Administrator | Manages tenant configuration |
-| Platform Administrator | Manages providers, models and policies |
-| LLM Provider | Executes inference |
-| Evaluation Worker | Evaluates inference outputs |
-| Observability Platform | Receives traces and metrics |
+| Domain | Business rules, entities, value objects, domain services |
+| Application | Use cases, orchestration, ports and interfaces |
+| Infrastructure | PostgreSQL, Redis, providers, secret manager, event broker |
+| Presentation | HTTP API, middleware, request and response DTOs |
 
-## 2.3 System Boundary
+Dependencies point inward.
 
-The gateway owns:
+The domain layer must not depend on Axum, SQLx, Redis, HTTP clients, or provider SDKs.
 
-- API authentication.
-- Tenant identification.
-- Request admission.
-- Policy enforcement.
-- Budget reservations.
-- Model selection.
-- Provider execution orchestration.
-- Response normalization.
-- Cache management.
-- Usage accounting.
-- Telemetry generation.
+### 3.2 Event-Driven Architecture
 
-External infrastructure owns:
+The synchronous inference path publishes events for asynchronous processing.
 
-- Model inference.
-- Durable database storage.
-- Distributed caching.
-- Event transportation.
-- Trace storage and visualization.
-- Automated evaluation execution.
+Examples:
+
+- InferenceRequested
+- InferenceCompleted
+- InferenceFailed
+- UsageRecorded
+- BudgetThresholdReached
+- ProviderHealthChanged
+- EvaluationRequested
+- EvaluationCompleted
+- APIKeyCreated
+- APIKeyRevoked
+- PolicyUpdated
+
+The transactional outbox pattern should be used when a database transaction must reliably produce an event.
 
 ---
 
-# 3. High-Level Architecture
+## 4. Logical Components
 
-## 3.1 Logical Architecture
-
-The system consists of five major architectural layers.
-
-1. API and ingress layer.
-2. Application orchestration layer.
-3. Domain and policy layer.
-4. Infrastructure and provider integration layer.
-5. Asynchronous observability and evaluation layer.
-
-```mermaid
-flowchart TB
-    APP["Applications / Agents"]
-
-    subgraph Gateway["LLM Gateway - Rust"]
-        direction TB
-
-        subgraph API["API Layer"]
-            HTTP["Axum HTTP API"]
-            AUTH["Authentication Middleware"]
-            VALID["Request Validation"]
-        end
-
-        subgraph APP_LAYER["Application Layer"]
-            UC1["Inference Use Case"]
-            UC2["Routing Use Case"]
-            UC3["Budget Use Case"]
-            UC4["Provider Execution Use Case"]
-        end
-
-        subgraph DOMAIN["Domain Layer"]
-            POLICY["Policy Engine"]
-            ROUTER["Model Router"]
-            BUDGET["Budget Domain"]
-            PROVIDER["Provider Contracts"]
-            CACHE["Cache Policy"]
-        end
-
-        subgraph INFRA["Infrastructure Layer"]
-            DB["PostgreSQL Adapter"]
-            RC["Redis Adapter"]
-            ADAPTER["Provider Adapters"]
-            EVENTS["Event Publisher"]
-            OTEL["Telemetry Adapter"]
-        end
-    end
-
-    subgraph External["External Infrastructure"]
-        PG["PostgreSQL"]
-        REDIS["Redis"]
-        OPENAI["OpenAI"]
-        CLAUDE["Anthropic"]
-        LOCAL["vLLM / Ollama"]
-        QUEUE["Event Broker"]
-        OBS["Langfuse / Grafana"]
-        EVAL["Python Evaluation Worker"]
-    end
-
-    APP --> HTTP --> AUTH --> VALID
-    VALID --> UC1
-    UC1 --> UC2
-    UC1 --> UC3
-    UC1 --> UC4
-
-    UC2 --> ROUTER
-    UC3 --> BUDGET
-    UC4 --> PROVIDER
-    UC1 --> POLICY
-    UC1 --> CACHE
-
-    DB --> PG
-    RC --> REDIS
-    ADAPTER --> OPENAI
-    ADAPTER --> CLAUDE
-    ADAPTER --> LOCAL
-    EVENTS --> QUEUE
-    OTEL --> OBS
-
-    QUEUE --> EVAL
-```
-
-## 3.2 Architectural Separation
-
-The Rust gateway follows Clean Architecture.
-
-### API Layer
+### 4.1 API Gateway
 
 Responsibilities:
 
-- HTTP endpoints.
-- Authentication middleware.
-- Request parsing.
-- Input validation.
-- Response serialization.
-- Streaming response handling.
+- Expose the public API.
+- Validate HTTP structure and content types.
+- Enforce request-size limits.
+- Apply request timeouts.
+- Extract correlation and idempotency identifiers.
+- Invoke application use cases.
+- Normalize error responses.
+- Handle streaming responses.
 
-Framework:
+Technology: Rust, Axum, Tokio, Tower.
 
-- Axum.
-- Tower.
-- Serde.
-
-The API layer must not contain business rules.
-
-### Application Layer
+### 4.2 Identity Management
 
 Responsibilities:
 
-- Coordinate use cases.
-- Manage request execution.
-- Invoke domain services.
-- Coordinate repository interfaces.
-- Manage transactions.
-- Coordinate provider execution.
-- Publish domain and integration events.
+- Manage virtual API keys.
+- Authenticate API requests.
+- Manage key expiration and revocation.
+- Associate keys with tenants and projects.
+- Support key scopes and permissions.
+- Record key lifecycle events.
 
-Application use cases:
+Virtual API keys are credentials issued by this gateway to client applications.
 
-- CreateInferenceRequest.
-- ExecuteInference.
-- ResolveModel.
-- ReserveBudget.
-- ReconcileUsage.
-- ExecuteFallback.
-- EvaluateCacheEligibility.
-- RecordInferenceExecution.
+**Storage rule:** store only a cryptographic hash of the virtual API key, never the raw key.
 
-### Domain Layer
+### 4.3 Authorization and Tenant Isolation
 
 Responsibilities:
 
-- Define business entities.
-- Enforce domain invariants.
-- Define policies.
-- Calculate routing decisions.
-- Calculate cost estimates.
-- Control budget state transitions.
-- Define provider contracts.
+- Enforce RBAC.
+- Verify tenant and project ownership.
+- Enforce resource-level permissions.
+- Prevent cross-tenant access.
+- Enforce API key scopes.
 
-The domain layer must not depend on Axum, SQLx, Redis, Reqwest, or provider SDKs.
+Initial roles:
 
-### Infrastructure Layer
+| Role | Permissions |
+|---|---|
+| Platform Admin | Platform-wide administration |
+| Tenant Admin | Manage tenant resources and policies |
+| Project Admin | Manage project configuration and keys |
+| Developer | Execute permitted inference requests |
+| Auditor | Read permitted usage and audit records |
 
-Responsibilities:
+Authorization must be checked independently of authentication.
 
-- PostgreSQL repositories.
-- Redis cache implementation.
-- Provider HTTP clients.
-- Event publishing.
-- OpenTelemetry integration.
-- External service communication.
+A valid API key does not automatically authorize access to every resource.
 
-Infrastructure implements interfaces defined by the application and domain layers.
-
----
-
-# 4. Core Component Architecture
-
-## 4.1 API Gateway
-
-**Responsibility:** Expose a standardized interface to applications.
-
-Initial endpoints:
-
-| Method | Endpoint | Description |
-|---|---|---|
-| POST | /v1/chat/completions | Chat completion |
-| GET | /v1/models | Available models |
-| GET | /health | Liveness |
-| GET | /ready | Readiness |
-| GET | /admin/providers | Provider management |
-| GET | /admin/usage | Usage information |
-| GET | /admin/budgets | Budget management |
-
-The initial compatibility target is the OpenAI Chat Completions API.
-
-Provider-specific features must be normalized or explicitly exposed as supported extensions.
-
-## 4.2 Identity and Tenant Management
+### 4.4 Request Validator
 
 Responsibilities:
 
-- API key validation.
-- Tenant resolution.
-- Project resolution.
-- Role verification.
-- Key expiration.
-- Key revocation.
-- Request authorization.
+- Validate model identifiers.
+- Validate message structures.
+- Enforce input and output token limits.
+- Validate sampling parameters.
+- Reject unsupported capabilities.
+- Enforce content-type and payload-size limits.
+- Detect malformed or prohibited requests.
 
-An API key must never be stored in plaintext.
+Validation should occur before expensive downstream operations.
 
-## 4.3 Policy Engine
-
-The policy engine determines whether a request is permitted.
-
-Policy dimensions:
-
-- Tenant permissions.
-- Project permissions.
-- Allowed providers.
-- Allowed models.
-- Maximum input tokens.
-- Maximum output tokens.
-- Maximum context length.
-- Data sensitivity.
-- Budget restrictions.
-- Rate limits.
-
-The engine returns an explicit policy decision:
-
-- ALLOW.
-- DENY.
-- ALLOW_WITH_CONSTRAINTS.
-
-## 4.4 Budget Manager
+### 4.5 PII Protection
 
 Responsibilities:
 
-- Estimate inference cost.
-- Reserve budget.
-- Reconcile actual expenditure.
-- Release unused reservations.
-- Enforce daily and monthly limits.
-- Record financial transactions.
+- Detect configured sensitive information.
+- Apply tenant-specific redaction policies.
+- Prevent accidental sensitive-data exposure in logs.
+- Control which request fields may be retained.
+- Apply configurable retention policies.
 
-PostgreSQL is the authoritative financial ledger.
+PII protection must distinguish between the content sent to the provider and the content retained for observability.
 
-Redis may provide fast admission-control data but must not be the sole source of financial truth.
-
-## 4.5 Model Router
+### 4.6 Abuse Protection
 
 Responsibilities:
 
-- Resolve model aliases.
-- Evaluate model capabilities.
-- Apply routing policies.
-- Estimate cost.
-- Evaluate provider health.
-- Select eligible providers.
-- Explain routing decisions.
+- Detect suspicious request patterns.
+- Identify repeated authentication failures.
+- Protect against oversized payloads.
+- Detect excessive request bursts.
+- Apply configurable abuse rules.
+- Temporarily block abusive API keys or tenants.
 
-Routing dimensions:
+Abuse detection must not replace authentication, rate limiting, or authorization.
+
+### 4.7 Policy Engine
+
+Responsibilities:
+
+- Evaluate tenant policies.
+- Enforce allowed providers and models.
+- Enforce model capabilities.
+- Apply data residency requirements.
+- Enforce cost constraints.
+- Enforce model restrictions.
+- Return explicit allow or deny decisions.
+
+The policy engine evaluates business rules; it should not own persistence or network-specific implementation details.
+
+### 4.8 Rate Limiter
+
+Rate limiting controls request consumption over time.
+
+It is different from a financial budget.
+
+Supported dimensions:
 
 | Dimension | Example |
 |---|---|
-| Complexity | Low / Medium / High |
-| Capability | Coding / Reasoning / JSON |
-| Context | Short / Long |
-| Cost | Estimated request cost |
-| Latency | Expected response time |
-| Availability | Provider health |
-| Quality | Historical evaluation results |
-| Security | Deployment and data restrictions |
+| Requests per second | 10 requests/sec |
+| Requests per minute | 300 requests/min |
+| Tokens per minute | 100,000 tokens/min |
+| Tenant limit | 1,000 requests/min |
+| Project limit | 300 requests/min |
+| API key limit | 60 requests/min |
+| Provider limit | Provider-specific quota |
 
-Routing must be deterministic for a given configuration and input classification, except where explicitly configured weighted selection is used.
+Initial algorithm: Token Bucket.
 
-## 4.6 Provider Adapter
+Additional algorithms:
 
-Each provider implements a common contract.
+- Sliding Window for accurate rolling-window limits.
+- Semaphore-based admission for concurrent request limits.
 
-Initial adapters:
+Redis should provide distributed atomic enforcement, using Lua scripts or equivalent atomic operations.
 
-- OpenAI.
-- Anthropic.
-- vLLM.
-- Ollama.
+The system must define behavior when Redis is unavailable. Security-sensitive limits should fail closed unless an explicitly approved fallback policy exists.
+
+### 4.9 Concurrency Manager
 
 Responsibilities:
 
-- Authentication.
-- Request translation.
-- HTTP communication.
-- Response translation.
-- Streaming.
-- Error normalization.
-- Usage extraction.
+- Enforce maximum simultaneous requests.
+- Apply tenant-level concurrency limits.
+- Apply project-level concurrency limits.
+- Apply provider-level concurrency limits.
+- Release permits after completion or cancellation.
+- Prevent resource exhaustion.
 
-Provider-specific behavior must not leak into the domain layer.
+Concurrency limits are independent of requests-per-minute limits.
 
-## 4.7 Cache Engine
+### 4.10 Budget Manager
+
+Responsibilities:
+
+- Manage tenant and project budgets.
+- Reserve estimated inference costs.
+- Reconcile actual provider costs.
+- Prevent overspending.
+- Track daily and monthly usage.
+- Support configurable warning thresholds.
+
+Budget enforcement requires atomic reservation and settlement.
+
+PostgreSQL is the durable financial source of truth. Redis may support fast admission decisions but must not be the only record of financial usage.
+
+### 4.11 Secret Manager
+
+The system has two distinct credential categories.
+
+**A. Virtual API keys**
+
+- Issued to gateway clients.
+- Stored as hashes in PostgreSQL.
+- Support expiration, rotation, and revocation.
+- Associated with tenant, project, and scopes.
+
+**B. Provider credentials**
+
+- OpenAI API keys.
+- Anthropic API keys.
+- Other provider credentials.
+- Internal inference endpoint credentials.
+
+Provider credentials must never be committed to Git, embedded in container images, or stored as plaintext in application configuration.
+
+Initial implementation:
+
+- Local development: environment variables or Docker secrets.
+- Production: HashiCorp Vault or a cloud secret manager.
+- Database: store secret references and metadata, not provider secret values.
+
+Define a provider abstraction:
+
+```rust
+#[async_trait::async_trait]
+pub trait SecretProvider: Send + Sync {
+    async fn get_secret(
+        &self,
+        secret_name: &str,
+    ) -> Result<SecretValue, SecretError>;
+}
+```
+
+The implementation must support credential rotation and must avoid logging secret values.
+
+### 4.12 Model Registry
+
+Responsibilities:
+
+- Register providers and models.
+- Store model capabilities.
+- Store context-window limits.
+- Store supported input and output modalities.
+- Store pricing metadata.
+- Store operational status.
+- Version model configuration.
+
+Model metadata must be configurable rather than hardcoded throughout the routing engine.
+
+### 4.13 Model Router
+
+Responsibilities:
+
+- Select an eligible model.
+- Evaluate task requirements.
+- Evaluate model capabilities.
+- Consider quality requirements.
+- Consider latency objectives.
+- Consider provider health.
+- Consider budget constraints.
+- Explain routing decisions.
+
+Routing objective:
+
+> Select the lowest-cost eligible model that satisfies the request's quality, capability, policy, reliability, and latency constraints.
+
+### 4.14 Provider Adapters
+
+Each provider has a dedicated adapter implementing a common interface.
+
+Responsibilities:
+
+- Translate normalized requests.
+- Resolve provider credentials.
+- Call the provider.
+- Handle streaming.
+- Normalize provider responses.
+- Normalize provider errors.
+- Extract usage and cost information.
+
+Initial providers:
+
+- OpenAI
+- Anthropic
+- vLLM
+- Ollama
+
+Provider-specific behavior must remain isolated from domain and application layers.
+
+### 4.15 Reliability Engine
+
+Responsibilities:
+
+- Request timeout management.
+- Retry classification.
+- Exponential backoff with jitter.
+- Circuit breakers.
+- Provider health monitoring.
+- Fallback execution.
+- Cancellation propagation.
+
+Retries must be bounded and must respect provider `Retry-After` information.
+
+Streaming fallback requires special treatment: after tokens have been delivered to a client, switching providers may create an invalid or duplicated response.
+
+### 4.16 Cache Engine
 
 Two cache strategies:
 
-**Exact Cache**
+**Exact cache**
+- Hash normalized request and compatible configuration.
+- Return a matching response.
+- Enforce tenant isolation.
+- Apply TTL and invalidation rules.
 
-Uses a canonical request fingerprint.
+**Semantic cache**
+- Compare request embeddings.
+- Apply similarity thresholds.
+- Enforce tenant and authorization boundaries.
+- Exclude sensitive data by default.
+- Evaluate false-positive rates.
 
-**Semantic Cache**
+Semantic cache must not return an answer simply because two prompts are semantically similar. Compatibility and authorization must also be established.
 
-Uses embedding similarity and eligibility rules.
-
-Cache keys must account for:
-
-- Tenant.
-- Project.
-- Model compatibility.
-- Prompt version.
-- Generation parameters.
-- Authorization context.
-- Data sensitivity.
-
-Caching is disabled by default for requests that are unsafe to reuse.
-
-## 4.8 Telemetry Engine
+### 4.17 Usage Accounting
 
 Responsibilities:
 
-- Create inference spans.
-- Propagate trace context.
 - Record token usage.
-- Record cost.
-- Capture provider latency.
-- Record routing decisions.
-- Track retries and fallback.
-- Track cache decisions.
-- Publish structured inference events.
+- Record provider cost.
+- Record model and provider.
+- Associate usage with tenant and project.
+- Reconcile estimated and actual costs.
+- Support reporting and audit.
 
-Sensitive content must be redacted or excluded according to telemetry policy.
+Usage accounting is separate from budget enforcement, although both consume usage information.
+
+### 4.18 Audit Logger
+
+Responsibilities:
+
+- Record security-sensitive actions.
+- Record API key lifecycle events.
+- Record authorization failures.
+- Record policy changes.
+- Record secret reference changes.
+- Record budget modifications.
+- Record administrative operations.
+
+Audit events must be durable, access-controlled, and tamper-resistant to the extent supported by the deployment.
+
+Do not put raw API keys, provider secrets, or unnecessary prompt content in audit records.
+
+### 4.19 Observability
+
+Responsibilities:
+
+- Distributed traces.
+- Metrics.
+- Structured logs.
+- Provider latency.
+- Token usage.
+- Cost per request.
+- Routing decisions.
+- Error rates.
+- Cache hit rates.
+- Rate-limit rejections.
+
+Technology:
+
+- OpenTelemetry
+- OpenInference conventions where applicable
+- Prometheus
+- Grafana
+- Langfuse
+
+### 4.20 Evaluation Worker
+
+A separate Python service performs asynchronous quality evaluation.
+
+Responsibilities:
+
+- Consume inference events.
+- Select eligible samples.
+- Evaluate output quality.
+- Evaluate faithfulness and relevance where applicable.
+- Run safety checks.
+- Store evaluation results.
+- Produce quality reports.
+
+Technology:
+
+- Python
+- DeepEval
+- RAGAS
+- Langfuse integrations where useful
+
+Evaluation must not block the synchronous inference response.
 
 ---
 
-# 5. Inference Request Lifecycle
+## 5. Request Admission and Inference Flow
 
-## 5.1 Standard Inference Sequence
+The most important architectural rule is that provider execution must not begin until all required admission controls have passed.
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant APP as Application
-    participant GW as Gateway
-    participant AUTH as Identity
-    participant POL as Policy Engine
-    participant BUD as Budget Manager
-    participant CACHE as Cache
-    participant ROUTER as Model Router
-    participant PROV as Provider
+    participant C as Client
+    participant API as Gateway API
+    participant ID as Identity
+    participant AZ as Authorization
+    participant V as Validator / PII
+    participant RL as Rate Limiter
+    participant CM as Concurrency Manager
+    participant P as Policy Engine
+    participant B as Budget Manager
+    participant R as Router
+    participant S as Secret Manager
+    participant PR as Provider
     participant DB as PostgreSQL
-    participant EVT as Event Broker
+    participant E as Event Broker
 
-    APP->>GW: POST /v1/chat/completions
-    GW->>AUTH: Validate API key
-    AUTH-->>GW: Tenant and project context
-    GW->>POL: Evaluate request policies
-    POL-->>GW: ALLOW / DENY
+    C->>API: Inference request
+    API->>ID: Authenticate virtual key
+    ID->>DB: Verify key hash and status
+    ID-->>API: Authenticated identity
 
-    GW->>BUD: Estimate and reserve cost
-    BUD->>DB: Atomic reservation
-    DB-->>BUD: Reservation confirmed
-    BUD-->>GW: Reservation ID
+    API->>AZ: Authorize tenant/project/action
+    AZ-->>API: Authorization decision
 
-    GW->>CACHE: Exact cache lookup
+    API->>V: Validate and inspect request
+    V-->>API: Validated request
 
-    alt Cache hit
-        CACHE-->>GW: Cached response
-    else Cache miss
-        GW->>ROUTER: Select eligible model
-        ROUTER-->>GW: Routing decision
-        GW->>PROV: Execute inference
-        PROV-->>GW: Provider response
-        GW->>CACHE: Store eligible response
-    end
+    API->>RL: Check rate limits
+    RL-->>API: Admission decision
 
-    GW->>BUD: Reconcile actual cost
-    BUD->>DB: Record usage and settlement
-    DB-->>BUD: Settlement confirmed
+    API->>CM: Acquire concurrency permit
+    CM-->>API: Permit granted
 
-    GW->>EVT: Publish inference event
-    GW-->>APP: Normalized response
+    API->>P: Evaluate tenant policies
+    P-->>API: Policy decision
+
+    API->>B: Reserve estimated budget
+    B->>DB: Atomic reservation
+    B-->>API: Reservation granted
+
+    API->>R: Select eligible model
+    R-->>API: Routing decision
+
+    API->>S: Resolve provider secret reference
+    S-->>API: Provider credential
+
+    API->>PR: Execute inference
+    PR-->>API: Normalized response and usage
+
+    API->>B: Reconcile actual cost
+    B->>DB: Settle reservation
+
+    API->>E: Publish inference and usage events
+    API-->>C: Inference response
 ```
 
-## 5.2 Request Processing Invariants
+### Admission sequence
 
-- No provider execution before required admission controls pass.
-- No provider execution without a valid budget reservation when budget enforcement applies.
-- Every inference execution has a unique execution identifier.
-- Every provider attempt is independently identifiable.
-- Budget settlement must be idempotent.
-- Cache hits must be recorded as inference executions.
-- Every completed request must have a usage outcome, including zero-cost outcomes where applicable.
-- Evaluation must not block ordinary inference responses.
+1. Authenticate the virtual API key.
+2. Authorize the tenant, project, and requested operation.
+3. Validate the request.
+4. Apply configured PII and abuse controls.
+5. Check distributed rate limits.
+6. Acquire concurrency capacity.
+7. Evaluate tenant and model policies.
+8. Reserve the estimated budget.
+9. Check cache eligibility.
+10. Select an eligible model.
+11. Resolve provider credentials.
+12. Execute provider inference.
+13. Reconcile actual usage and cost.
+14. Release concurrency capacity.
+15. Publish events and telemetry.
+16. Return the normalized response.
 
-## 5.3 Streaming Requests
+Some operations may be reordered when safe, but the admission invariants must remain intact.
 
-Streaming requests use asynchronous response streaming.
+For example, a cache lookup may occur before provider routing, but it must not bypass authentication, authorization, tenant isolation, rate limits, or required budget policy.
+
+---
+
+## 6. Request Lifecycle and Failure Handling
+
+| Failure | Expected behavior |
+|---|---|
+| Invalid API key | Reject with 401 |
+| Insufficient permission | Reject with 403 |
+| Invalid payload | Reject with 400 |
+| Rate limit exceeded | Reject with 429 |
+| Concurrency limit exceeded | Reject with 429 or configured overload response |
+| Budget exhausted | Reject with 402 or documented gateway policy |
+| Model prohibited | Reject with policy error |
+| Provider timeout | Apply bounded retry/fallback policy |
+| Provider unavailable | Open circuit and evaluate fallback |
+| Secret manager unavailable | Fail closed for provider credential resolution |
+| Redis unavailable | Apply configured fail-open/fail-closed policy per control |
+| PostgreSQL unavailable | Reject operations requiring durable authorization or financial guarantees |
+
+The API must return consistent error objects with stable error codes and correlation IDs.
+
+---
+
+## 7. Streaming Architecture
+
+Streaming requests require a separate execution path.
 
 Requirements:
 
-- Incremental token forwarding.
-- Cancellation propagation.
-- Request deadline enforcement.
-- Token usage collection where provider support permits.
-- Partial execution tracking.
-- Explicit settlement for interrupted streams.
-- No automatic fallback after client-visible output unless a safe protocol is explicitly defined.
+- Support server-sent events.
+- Propagate cancellation.
+- Enforce request and idle timeouts.
+- Track partial token usage when available.
+- Release concurrency permits on disconnect.
+- Record incomplete provider executions.
+- Prevent unsafe provider switching after output has been delivered.
+
+A streaming response should not be buffered entirely in memory.
 
 ---
 
-# 6. Intelligent Routing Architecture
+## 8. Data Architecture
 
-## 6.1 Routing Pipeline
+### PostgreSQL — authoritative storage
 
-```mermaid
-flowchart TD
-    A["Incoming Request"] --> B["Request Classification"]
-    B --> C["Capability Requirements"]
-    C --> D["Context Validation"]
-    D --> E["Security and Policy Constraints"]
-    E --> F["Eligible Model Filtering"]
-    F --> G["Cost and Latency Estimation"]
-    G --> H["Quality and Availability Assessment"]
-    H --> I["Routing Strategy"]
-    I --> J["Selected Model"]
-    J --> K["Provider Execution"]
-```
+Stores:
 
-## 6.2 Routing Strategies
+- Tenants and projects.
+- Users and roles.
+- Virtual API key hashes.
+- Policies and configurations.
+- Budget definitions.
+- Budget reservations and settlements.
+- Usage records.
+- Provider and model registry.
+- Routing rules.
+- Audit events.
+- Idempotency records.
+- Outbox events.
+- Evaluation results.
 
-Initial strategies:
+### Redis — operational storage
 
-- Rule-based routing.
-- Capability-based routing.
-- Cost-optimized routing.
-- Latency-optimized routing.
-- Complexity-based routing.
-- Provider-health-aware routing.
+Stores:
 
-## 6.3 Model Eligibility
+- Distributed rate-limit state.
+- Concurrency counters and permits.
+- Short-lived operational state.
+- Exact cache entries.
+- Semantic cache coordination.
+- Provider health state where appropriate.
 
-A model must be excluded if it violates:
+Redis must not be the only durable source for budgets, audit records, or usage accounting.
 
-- Tenant permissions.
-- Provider restrictions.
-- Context requirements.
-- Modality requirements.
-- Data residency restrictions.
-- Security policies.
-- Required structured-output capabilities.
+### Event broker
 
-The router must never choose a model solely because it is cheaper.
+Initial option: Redis Streams.
 
-## 6.4 Routing Decision Record
+Future option: Kafka or another durable event platform when throughput, replay, and retention requirements justify it.
 
-Every routing decision should capture:
-
-- Request ID.
-- Candidate models.
-- Excluded models and reasons.
-- Selected provider.
-- Selected model.
-- Estimated cost.
-- Estimated latency.
-- Routing policy version.
-- Complexity score, if available.
-- Selection reason.
+Use the transactional outbox pattern to avoid losing events between database commits and event publication.
 
 ---
 
-# 7. Provider Reliability Architecture
+## 9. Security Architecture
 
-## 7.1 Reliability Components
+Security is a cross-cutting architectural concern.
 
-The reliability engine contains:
+### Security controls
 
-- Timeout manager.
-- Retry policy.
-- Backoff strategy.
-- Circuit breaker.
-- Provider health tracker.
-- Fallback selector.
-
-## 7.2 Failure Classification
-
-| Failure | Strategy |
+| Control | Primary responsibility |
 |---|---|
-| 400 Bad Request | Reject |
-| 401 Unauthorized | Configuration failure |
-| 403 Forbidden | Reject |
-| 429 Rate Limited | Respect Retry-After and apply bounded retry |
-| 5xx | Bounded retry and eligible fallback |
-| Connection failure | Retry or fallback |
-| Timeout | Retry only when safe |
-| Context overflow | Re-evaluate eligible models |
-| Budget exceeded | Reject according to budget policy |
+| Authentication | Verify API key or administrative identity |
+| Authorization | Enforce roles, scopes, and resource permissions |
+| Tenant isolation | Prevent cross-tenant access |
+| Secret management | Protect provider credentials |
+| Request validation | Reject malformed and prohibited input |
+| PII protection | Control sensitive data exposure |
+| Abuse protection | Detect suspicious activity |
+| Rate limiting | Control request and token consumption |
+| Concurrency control | Limit simultaneous execution |
+| Budget enforcement | Prevent unauthorized financial exposure |
+| Audit logging | Record security-sensitive operations |
+| TLS | Protect network communication |
+| Idempotency | Prevent duplicate execution where supported |
 
-## 7.3 Circuit Breaker States
+### Security invariants
 
-- CLOSED: Requests permitted.
-- OPEN: Requests rejected or routed elsewhere.
-- HALF_OPEN: Limited health probes.
-
-Circuit breakers must be maintained independently for provider/model combinations where appropriate.
-
-## 7.4 Retry Safety
-
-The system must distinguish between:
-
-- Failures before provider execution.
-- Failures during execution.
-- Failures after provider execution.
-- Failures after partial streaming output.
-
-The gateway must not assume that a timeout means the provider did not execute the request.
-
-Financial reconciliation must account for uncertain provider outcomes.
+- No plaintext provider credentials in source control.
+- No raw virtual API keys in persistent storage.
+- No provider request before successful admission.
+- No cross-tenant cache access.
+- No secret values in logs or traces.
+- No administrative action without authorization.
+- All sensitive configuration changes must be auditable.
 
 ---
 
-# 8. Observability Architecture
+## 10. Observability Architecture
 
-## 8.1 Telemetry Flow
+Every inference execution should have a trace.
 
-```mermaid
-flowchart LR
-    GW["Rust Gateway"] --> OTEL["OpenTelemetry SDK"]
-    OTEL --> COL["OpenTelemetry Collector"]
-
-    COL --> TRACE["Trace Backend"]
-    COL --> METRIC["Metrics Backend"]
-
-    TRACE --> LF["Langfuse"]
-    METRIC --> PROM["Prometheus"]
-    PROM --> GRAF["Grafana"]
-```
-
-## 8.2 Trace Structure
-
-Example distributed trace:
+Suggested span hierarchy:
 
 ```text
-Inference Request
-│
-├── Authentication
-├── Policy Evaluation
-├── Budget Reservation
-├── Cache Lookup
-├── Routing Decision
-│
-├── Provider Execution
-│   ├── Provider Attempt 1
-│   └── Provider Attempt 2 (Fallback)
-│
-├── Usage Reconciliation
-└── Event Publication
+llm.gateway.request
+ ├── authentication
+ ├── authorization
+ ├── request.validation
+ ├── pii.protection
+ ├── rate_limit.check
+ ├── concurrency.acquire
+ ├── policy.evaluate
+ ├── budget.reserve
+ ├── cache.lookup
+ ├── routing.select
+ ├── provider.resolve_secret
+ ├── provider.execute
+ ├── usage.reconcile
+ ├── budget.settle
+ └── event.publish
 ```
 
-## 8.3 Metrics
+Core metrics:
 
-### Gateway
+| Metric | Description |
+|---|---|
+| `gateway_requests_total` | Total requests |
+| `gateway_request_duration_seconds` | End-to-end duration |
+| `gateway_admission_rejections_total` | Rejected requests by control |
+| `gateway_rate_limit_rejections_total` | Rate-limit rejections |
+| `gateway_concurrent_requests` | Active requests |
+| `gateway_provider_requests_total` | Provider calls |
+| `gateway_provider_errors_total` | Provider errors |
+| `gateway_provider_latency_seconds` | Provider latency |
+| `gateway_tokens_total` | Token consumption |
+| `gateway_cost_total` | Estimated or reconciled cost |
+| `gateway_cache_hits_total` | Cache hits |
+| `gateway_budget_reservations_total` | Budget reservations |
+| `gateway_routing_decisions_total` | Routing decisions |
 
-- Request count.
-- Request errors.
-- Request latency.
-- Active requests.
-- Streaming duration.
-
-### Providers
-
-- Request count.
-- Error rate.
-- Timeout rate.
-- Provider latency.
-- Retry rate.
-- Fallback rate.
-
-### Cost
-
-- Input tokens.
-- Output tokens.
-- Estimated cost.
-- Actual cost.
-- Spend per tenant.
-- Spend per project.
-- Spend per model.
-
-### Cache
-
-- Exact cache hit rate.
-- Semantic cache hit rate.
-- Cache lookup latency.
-- Cache savings.
-- Invalid cache reuse rate.
-
-### Routing
-
-- Model selection distribution.
-- Routing latency.
-- Cost per selected model.
-- Quality per model.
-- Routing policy effectiveness.
+Sensitive prompt and response content must not be recorded by default.
 
 ---
 
-# 9. Asynchronous Evaluation Architecture
+## 11. Deployment Architecture
 
-## 9.1 Architecture
-
-The evaluation service is implemented in Python because of its mature evaluation ecosystem.
-
-```mermaid
-flowchart TD
-    GW["Rust Gateway"]
-    EVT["Inference Event"]
-    Q["Durable Event Broker"]
-    WORKER["Python Evaluation Worker"]
-    DATA["Evaluation Dataset"]
-    ENGINE["DeepEval / RAGAS"]
-    DB["Evaluation Results Store"]
-    ALERT["Quality Alerting"]
-    LF["Langfuse"]
-
-    GW --> EVT --> Q --> WORKER
-    DATA --> WORKER
-    WORKER --> ENGINE
-    ENGINE --> DB
-    DB --> ALERT
-    DB --> LF
-```
-
-## 9.2 Evaluation Types
-
-**Offline evaluation**
-
-- Fixed datasets.
-- Model comparisons.
-- Prompt regression.
-- Routing policy validation.
-
-**Production evaluation**
-
-- Stratified traffic sampling.
-- High-risk request evaluation.
-- Failed execution evaluation.
-- Fallback evaluation.
-- Cache quality evaluation.
-
-## 9.3 Evaluation Metrics
-
-- Faithfulness.
-- Answer relevancy.
-- Task correctness.
-- Structured output validity.
-- Tool-call correctness.
-- Safety compliance.
-- Domain-specific quality.
-
-Evaluation results must include:
-
-- Dataset version.
-- Metric version.
-- Evaluator model.
-- Prompt version.
-- Model under evaluation.
-- Execution timestamp.
-- Evaluation score.
-- Evaluation status.
-
----
-
-# 10. Data Architecture
-
-## 10.1 PostgreSQL
-
-PostgreSQL is the authoritative store for:
-
-- Tenants.
-- Projects.
-- Users.
-- API keys.
-- Roles.
-- Providers.
-- Models.
-- Routing policies.
-- Budgets.
-- Budget reservations.
-- Usage records.
-- Audit events.
-- Evaluation metadata.
-
-## 10.2 Redis
-
-Redis supports:
-
-- Exact response cache.
-- Semantic cache coordination.
-- Distributed rate limiting.
-- Provider health state.
-- Short-lived request metadata.
-- Budget admission snapshots.
-
-Redis data must be treated as recoverable operational state, not the authoritative financial ledger.
-
-## 10.3 Event Broker
-
-The event broker carries:
-
-- Inference completed.
-- Inference failed.
-- Provider attempt completed.
-- Budget reconciled.
-- Cache hit.
-- Cache miss.
-- Evaluation requested.
-- Evaluation completed.
-
-Events must have stable identifiers, schema versions, and correlation identifiers.
-
-Use an outbox pattern for important events that must be published reliably alongside database transactions.
-
----
-
-# 11. Security Architecture
-
-## 11.1 Authentication
-
-- Virtual API keys.
-- Secure key hashing.
-- Key rotation.
-- Key expiration.
-- Key revocation.
-
-## 11.2 Authorization
-
-- Tenant-level access control.
-- Project-level access control.
-- Role-based access control.
-- Model-level permissions.
-- Provider-level permissions.
-
-## 11.3 Data Protection
-
-- TLS for external communication.
-- Secret management.
-- PII redaction.
-- Configurable prompt and response retention.
-- Tenant-aware cache isolation.
-- Restricted telemetry content.
-- Audit logging.
-
-## 11.4 Trust Boundaries
-
-Treat all incoming application payloads, model outputs, provider responses, and retrieved context as untrusted.
-
-Provider credentials must never be exposed to application clients.
-
----
-
-# 12. Deployment Architecture
-
-## 12.1 Initial Deployment
-
-Docker Compose is the initial deployment target.
+Initial deployment uses Docker Compose.
 
 ```mermaid
 flowchart TB
-    APP["Applications"]
+    CLIENT["Client Applications"]
 
-    subgraph COMPOSE["Docker Compose"]
+    subgraph DOCKER["Docker Compose"]
         GW["Rust Gateway"]
-        PG["PostgreSQL"]
-        REDIS["Redis"]
-        BROKER["Redis Streams / Kafka"]
+        PG[("PostgreSQL")]
+        REDIS[("Redis")]
+        BROKER["Event Broker"]
         EVAL["Python Evaluation Worker"]
-        OTEL["OTel Collector"]
-        LF["Langfuse"]
-        PROM["Prometheus"]
-        GRAF["Grafana"]
+        OBS["Observability Stack"]
     end
 
-    APP --> GW
+    PROVIDERS["External LLM Providers"]
+    SECRET["External Secret Manager"]
+
+    CLIENT --> GW
     GW --> PG
     GW --> REDIS
     GW --> BROKER
-    GW --> OTEL
+    GW --> PROVIDERS
+    GW --> SECRET
     BROKER --> EVAL
-    OTEL --> LF
-    OTEL --> PROM
-    PROM --> GRAF
+    EVAL --> PG
+    GW --> OBS
+    EVAL --> OBS
 ```
 
-## 12.2 Container Responsibilities
+### Deployment principles
 
-| Container | Responsibility |
+- Stateless Rust gateway instances.
+- Externalized configuration.
+- Health and readiness endpoints.
+- Graceful shutdown.
+- Database migrations.
+- Structured logs.
+- Secrets injected securely.
+- Resource limits.
+- Container health checks.
+- Separate development and production configurations.
+
+Kubernetes and multi-region deployment are future extensions, not initial requirements.
+
+---
+
+## 12. Rust Workspace Boundaries
+
+Proposed workspace:
+
+```text
+llm-gateway/
+├── Cargo.toml
+├── Cargo.lock
+├── rust-toolchain.toml
+├── .env.example
+├── docker-compose.yml
+│
+├── apps/
+│   └── gateway-server/
+│
+├── crates/
+│   ├── gateway-core/
+│   ├── shared-kernel/
+│   ├── identity/
+│   ├── authorization/
+│   ├── tenant-management/
+│   ├── secret-manager/
+│   ├── request-validator/
+│   ├── pii-protection/
+│   ├── abuse-protection/
+│   ├── policy-engine/
+│   ├── rate-limiter/
+│   ├── concurrency-manager/
+│   ├── budget-manager/
+│   ├── model-registry/
+│   ├── model-router/
+│   ├── provider-adapters/
+│   ├── reliability-engine/
+│   ├── cache-engine/
+│   ├── usage-accounting/
+│   ├── idempotency/
+│   ├── audit-logger/
+│   ├── telemetry/
+│   └── event-publisher/
+│
+├── services/
+│   └── evaluation-worker/
+│
+├── config/
+│   ├── models.yaml
+│   ├── routing.yaml
+│   ├── policies.yaml
+│   └── limits.yaml
+│
+├── migrations/
+├── tests/
+│   ├── integration/
+│   ├── contract/
+│   ├── security/
+│   └── load/
+│
+├── evals/
+│   ├── datasets/
+│   ├── metrics/
+│   └── reports/
+│
+└── docs/
+    ├── product.md
+    ├── architecture.md
+    ├── domain-model.md
+    ├── api-contracts.md
+    ├── security.md
+    ├── routing-policy.md
+    ├── data-model.md
+    ├── test-strategy.md
+    ├── definition-of-done.md
+    ├── build-plan.md
+    └── adr/
+```
+
+The workspace is a logical starting point. Avoid creating empty crates without a concrete implementation boundary. Some closely related capabilities may initially live together and be extracted as the project grows.
+
+---
+
+## 13. Architecture Decision Records
+
+Initial ADR candidates:
+
+| ADR | Decision |
 |---|---|
-| llm-gateway | Rust API and inference orchestration |
-| postgres | Durable application and financial data |
-| redis | Cache and distributed rate limiting |
-| event-broker | Asynchronous event transport |
-| evaluation-worker | Python evaluation processing |
-| otel-collector | Telemetry collection |
-| langfuse | LLM trace visualization |
-| prometheus | Metrics storage |
-| grafana | Operational dashboards |
+| ADR-001 | Rust as primary gateway language |
+| ADR-002 | Axum and Tokio for HTTP and asynchronous execution |
+| ADR-003 | Clean Architecture boundaries |
+| ADR-004 | PostgreSQL as authoritative database |
+| ADR-005 | Redis for distributed operational controls |
+| ADR-006 | Provider adapter abstraction |
+| ADR-007 | Token Bucket as primary rate-limit algorithm |
+| ADR-008 | Secret manager abstraction |
+| ADR-009 | Transactional outbox for event publication |
+| ADR-010 | OpenTelemetry for distributed tracing |
+| ADR-011 | Python evaluation worker |
+| ADR-012 | Budget reservation and settlement model |
+| ADR-013 | Idempotency strategy |
+| ADR-014 | Streaming and provider fallback behavior |
+| ADR-015 | Tenant isolation and cache boundaries |
 
-For the initial release, Redis Streams may serve as the event transport to reduce operational complexity. Kafka can be introduced when throughput and retention requirements justify it.
+Each ADR should include context, decision, alternatives, consequences, and status.
 
 ---
 
-# 13. Scalability and Reliability
+## 14. Architecture Quality Attributes
 
-## 13.1 Horizontal Scaling
-
-Gateway instances must be stateless.
-
-Shared state resides in:
-
-- PostgreSQL.
-- Redis.
-- Event broker.
-
-Multiple gateway instances must be able to process requests for the same tenant safely.
-
-## 13.2 Failure Isolation
-
-Failure of an external subsystem must not automatically cause total platform failure.
-
-| Component failure | Expected behavior |
+| Attribute | Initial target or requirement |
 |---|---|
-| LLM provider | Eligible fallback |
-| Redis cache | Bypass cache if policy permits |
-| Redis rate limiter | Apply configured fail-closed policy |
-| PostgreSQL | Reject operations requiring authoritative state |
-| Event broker | Durable outbox buffering |
-| Evaluation worker | Queue events for later processing |
-| Langfuse | Continue inference and retain telemetry where configured |
-| Metrics backend | Continue inference |
+| Performance | Gateway overhead p95 below 50 ms, excluding provider latency, under a defined benchmark |
+| Exact cache | p95 below 15 ms under defined benchmark conditions |
+| Availability | Initial target of 99.9%, subject to deployment assumptions |
+| Concurrency | Baseline test with 1,000 concurrent requests |
+| Security | Tenant isolation and secret-handling tests required |
+| Reliability | Bounded retries and circuit breakers |
+| Scalability | Horizontally scalable stateless gateway |
+| Maintainability | Explicit Clean Architecture boundaries |
+| Observability | Traceable inference lifecycle |
+| Financial integrity | Atomic reservation and idempotent settlement |
 
-## 13.3 Graceful Degradation
-
-The gateway must distinguish critical dependencies from optional observability and optimization dependencies.
-
-Security and financial governance must not be bypassed merely to preserve availability.
+These are engineering targets, not measured performance claims. Benchmark results must document hardware, workload, concurrency, provider conditions, and test duration.
 
 ---
 
-# 14. Architecture Decisions and Constraints
+## 15. Architecture Definition of Done
 
-The following decisions are proposed for formalization in ADRs.
+The architecture is ready for implementation when:
 
-| ID | Decision | Rationale |
-|---|---|---|
-| ADR-001 | Rust as primary gateway language | Performance, memory safety, concurrency |
-| ADR-002 | Axum as HTTP framework | Async Rust ecosystem and Tower integration |
-| ADR-003 | Clean Architecture | Separation of business rules and infrastructure |
-| ADR-004 | PostgreSQL as authoritative database | Durable financial and operational records |
-| ADR-005 | Redis for operational state | Low-latency cache and rate limiting |
-| ADR-006 | OpenTelemetry for telemetry | Vendor-neutral observability |
-| ADR-007 | Python evaluation service | Mature evaluation ecosystem |
-| ADR-008 | OpenAI-compatible API | Application integration simplicity |
-| ADR-009 | Event-driven evaluation | Inference and evaluation isolation |
-| ADR-010 | Docker Compose initially | Reproducible development and deployment |
-
----
-
-# 15. Architecture Quality Attributes
-
-The architecture will be evaluated against the following quality attributes.
-
-| Attribute | Verification |
-|---|---|
-| Performance | Load tests and latency benchmarks |
-| Scalability | Multi-instance concurrency tests |
-| Reliability | Provider failure injection |
-| Security | Authentication and isolation tests |
-| Financial integrity | Concurrent budget reservation tests |
-| Maintainability | Module boundaries and dependency checks |
-| Extensibility | Provider contract tests |
-| Observability | Trace correlation tests |
-| Quality assurance | Evaluation regression tests |
-| Resilience | Dependency failure tests |
+- [ ] All major components and responsibilities are documented.
+- [ ] Clean Architecture boundaries are defined.
+- [ ] Request admission sequence is documented.
+- [ ] Authentication and authorization are separated.
+- [ ] Tenant isolation strategy is defined.
+- [ ] Virtual API key lifecycle is defined.
+- [ ] Provider secret management is defined.
+- [ ] Rate limiting and concurrency controls are defined.
+- [ ] Budget reservation and settlement are defined.
+- [ ] Provider abstraction is defined.
+- [ ] Routing and fallback responsibilities are defined.
+- [ ] Streaming behavior is documented.
+- [ ] Cache isolation and compatibility rules are documented.
+- [ ] Audit and observability boundaries are defined.
+- [ ] Asynchronous evaluation is separated from inference.
+- [ ] Data ownership and event publication are defined.
+- [ ] Initial ADRs are identified.
+- [ ] Security and failure paths are documented.
 
 ---
 
-# 16. Architectural Constraints
+## 16. Next Document
 
-1. Domain logic must not depend on infrastructure frameworks.
-2. Provider-specific request models must not leak into domain entities.
-3. Every inference request must have a correlation ID.
-4. Every provider attempt must have an execution identifier.
-5. Budget reservation and reconciliation must be idempotent.
-6. Routing decisions must be explainable.
-7. Sensitive data must not be cached or traced without explicit policy authorization.
-8. Evaluation must be asynchronous by default.
-9. Financial accounting must not depend exclusively on Redis.
-10. All important external integrations must have explicit timeouts.
-11. All event schemas must be versioned.
-12. Streaming execution must support cancellation and partial-failure accounting.
+The next specification is `docs/domain-model.md`.
 
----
+It will define the business entities, value objects, aggregates, relationships, invariants, and lifecycle rules behind:
 
-# 17. Architecture Definition of Success
+- Tenants, projects, users, roles, and API keys.
+- Provider secret references.
+- Policies and model registry.
+- Rate limits and concurrency quotas.
+- Budget reservations and usage accounting.
+- Inference executions and provider attempts.
+- Routing decisions.
+- Cache entries.
+- Audit events and idempotency records.
+- Evaluation datasets and results.
 
-The architecture is considered validated when:
-
-- A client can call multiple LLM providers through one API.
-- The gateway can select models using configurable routing policies.
-- Tenant budgets are enforced under concurrent workloads.
-- Provider failures are handled through bounded retries and fallback.
-- Inference traces can be correlated across the complete execution lifecycle.
-- Evaluation runs independently of the inference request lifecycle.
-- The system can scale gateway instances horizontally.
-- Security boundaries are enforced across tenants.
-- The architecture supports new providers without modifying domain logic.
-
-**Core architectural principle:**
-
-The Rust gateway controls inference execution, policies, cost, and reliability. External providers execute models. The asynchronous evaluation platform measures quality. Observability connects the complete lifecycle.
-
-This separation is the foundation of `llm-gateway`.
+The domain model will distinguish financial budgets, request rate limits, and concurrency limits as separate concepts.
