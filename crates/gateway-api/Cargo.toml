@@ -1,0 +1,18 @@
+[package]
+name = "gateway-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gateway-core = { path = "../gateway-core" }
+gateway-application = { path = "../gateway-application" }
+gateway-infrastructure = { path = "../gateway-infrastructure" }
+
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
