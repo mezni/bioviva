@@ -1,1506 +1,841 @@
 # LLM Gateway — Domain Model
 
+**File:** `docs/domain-model.md`  
 **Version:** 1.0  
 **Status:** Draft  
-**Project:** `llm-gateway`  
-**Architecture:** Clean Architecture  
-**Implementation:** Rust
+**Project:** `llm-gateway`
 
----
+# 1. Purpose
 
-## 1. Purpose
+This document defines the domain model for the enterprise LLM Gateway.
 
-This document defines the core domain model for the LLM Gateway.
+The domain model describes:
 
-It describes:
-
-- Domain boundaries.
-- Entities and value objects.
-- Aggregates and aggregate roots.
-- Entity relationships.
-- Business invariants.
+- Core business entities.
+- Aggregate boundaries.
+- Value objects.
+- Relationships.
+- Domain invariants.
 - State transitions.
 - Domain events.
-- Domain service responsibilities.
-- Ownership and persistence boundaries.
+- Responsibilities of domain services.
 
-The domain model represents business concepts, not database tables or HTTP request structures.
+It is independent of HTTP, Axum, SQLx, Redis, provider SDKs, and infrastructure implementation details.
 
-Infrastructure-specific concerns such as SQLx models, Redis keys, HTTP DTOs, and provider SDK types must remain outside the domain layer.
+# 2. Domain Overview
 
----
+The gateway manages inference execution across multiple LLM providers while enforcing identity, authorization, financial, routing, and reliability policies.
 
-## 2. Domain Design Principles
+The domain is divided into the following areas:
 
-The domain follows these principles:
-
-1. Every business entity has a clear identity.
-2. Aggregate roots protect business invariants.
-3. Value objects are immutable.
-4. Financial operations must be auditable.
-5. Tenant ownership must be explicit.
-6. Secrets are referenced, never represented as plaintext domain data.
-7. Rate limits, concurrency quotas, and budgets are independent.
-8. Provider-specific models must not leak into the core domain.
-9. Domain events represent meaningful business changes.
-10. Domain logic must not depend on infrastructure.
-
----
-
-## 3. Bounded Contexts
-
-The system is divided into the following bounded contexts.
-
-| Bounded Context | Responsibility |
+| Domain | Responsibility |
 |---|---|
-| Tenant Management | Tenants, projects, membership |
-| Identity & Access | Users, API keys, roles, permissions |
-| Security & Secrets | Secret references and credential lifecycle |
-| Policy Management | Policies and model restrictions |
-| Traffic Management | Rate limits and concurrency quotas |
-| Financial Management | Budgets, reservations, settlements |
-| Model Management | Providers, models, capabilities, pricing |
-| Inference | Requests, executions, provider attempts |
-| Routing | Routing rules and routing decisions |
-| Caching | Exact and semantic cache entries |
-| Usage Accounting | Token usage and cost records |
+| Identity and Access | Users, API keys, roles, permissions |
+| Tenant Management | Tenants and projects |
+| Policy Management | Inference and security policies |
+| Model Registry | Providers, models, capabilities, pricing |
+| Inference Execution | Requests, executions, provider attempts |
+| Routing | Candidate selection and routing decisions |
+| Admission Control | Rate-limit and concurrency decisions |
+| Budget Management | Budget accounts and reservations |
+| Usage Accounting | Usage records and financial ledger |
+| Cache Management | Cache eligibility and cache metadata |
 | Audit | Security and administrative audit events |
-| Evaluation | Datasets, runs, and evaluation results |
 
-These are logical domain boundaries. They do not require a separate microservice for every context.
-
-The initial implementation should be a modular Rust application with explicit module boundaries.
-
----
-
-## 4. Domain Overview
+# 3. Domain Relationships
 
 ```mermaid
-flowchart TB
-    TENANT["Tenant"]
-    PROJECT["Project"]
-    USER["User"]
-    APIKEY["API Key"]
-    ROLE["Role / Permission"]
+erDiagram
+    TENANT ||--o{ PROJECT : owns
+    TENANT ||--o{ API_KEY : owns
+    PROJECT ||--o{ API_KEY : scopes
+    TENANT ||--o{ POLICY : configures
+    PROJECT ||--o{ POLICY : overrides
 
-    POLICY["Policy"]
-    LIMIT["Rate Limit Policy"]
-    CONCURRENCY["Concurrency Policy"]
-    BUDGET["Budget"]
+    TENANT ||--o{ BUDGET_ACCOUNT : owns
+    PROJECT ||--o{ BUDGET_ACCOUNT : owns
+    BUDGET_ACCOUNT ||--o{ BUDGET_RESERVATION : contains
+    BUDGET_RESERVATION ||--o{ USAGE_RECORD : reconciles
 
-    PROVIDER["Provider"]
-    SECRET["Provider Secret Reference"]
-    MODEL["Model"]
-    ROUTING["Routing Rule"]
+    PROVIDER ||--o{ MODEL : exposes
+    MODEL ||--o{ ROUTING_DECISION : selected_in
 
-    REQUEST["Inference Request"]
-    EXECUTION["Inference Execution"]
-    ATTEMPT["Provider Attempt"]
-    DECISION["Routing Decision"]
+    TENANT ||--o{ INFERENCE_EXECUTION : owns
+    PROJECT ||--o{ INFERENCE_EXECUTION : scopes
+    INFERENCE_EXECUTION ||--o{ PROVIDER_ATTEMPT : contains
+    INFERENCE_EXECUTION ||--o| ROUTING_DECISION : produces
+    INFERENCE_EXECUTION ||--o| BUDGET_RESERVATION : reserves
+    INFERENCE_EXECUTION ||--o{ USAGE_RECORD : generates
 
-    RESERVATION["Budget Reservation"]
-    USAGE["Usage Record"]
-    AUDIT["Audit Event"]
-
-    TENANT --> PROJECT
-    TENANT --> USER
-    TENANT --> APIKEY
-    USER --> ROLE
-    APIKEY --> PROJECT
-
-    TENANT --> POLICY
-    PROJECT --> POLICY
-    POLICY --> LIMIT
-    POLICY --> CONCURRENCY
-    POLICY --> BUDGET
-
-    PROVIDER --> SECRET
-    PROVIDER --> MODEL
-    MODEL --> ROUTING
-
-    PROJECT --> REQUEST
-    REQUEST --> EXECUTION
-    EXECUTION --> DECISION
-    EXECUTION --> ATTEMPT
-    EXECUTION --> RESERVATION
-    EXECUTION --> USAGE
-
-    TENANT --> AUDIT
+    INFERENCE_EXECUTION ||--o{ AUDIT_EVENT : records
 ```
 
----
+This diagram describes conceptual relationships. The persistence model may introduce additional tables and foreign keys.
 
-## 5. Shared Value Objects
+# 4. Aggregate Boundaries
 
-Value objects represent concepts identified by their attributes rather than a unique database identity.
+Aggregates define consistency boundaries. Each aggregate protects its own invariants.
 
-### 5.1 Identifiers
+| Aggregate | Aggregate Root | Main Responsibilities |
+|---|---|---|
+| Tenant | Tenant | Tenant lifecycle and ownership |
+| Project | Project | Project lifecycle and tenant association |
+| API Key | APIKey | Key lifecycle, scopes, revocation |
+| Policy | Policy | Policy configuration and version |
+| Model | Model | Model capabilities and availability |
+| Inference Execution | InferenceExecution | Logical inference lifecycle |
+| Budget Account | BudgetAccount | Spending limits and available balance |
+| Budget Reservation | BudgetReservation | Reserved, settled, released amounts |
+| Usage Record | UsageRecord | Normalized usage and cost attribution |
+| Financial Ledger | LedgerEntry | Immutable financial movements |
+| Provider | Provider | Provider configuration and lifecycle |
 
-Use strongly typed identifiers rather than passing arbitrary strings throughout the domain.
+Important consistency rule:
 
-```rust
-pub struct TenantId(Uuid);
-pub struct ProjectId(Uuid);
-pub struct UserId(Uuid);
-pub struct ApiKeyId(Uuid);
-pub struct ProviderId(Uuid);
-pub struct ModelId(Uuid);
-pub struct PolicyId(Uuid);
-pub struct BudgetId(Uuid);
-pub struct InferenceRequestId(Uuid);
-pub struct ExecutionId(Uuid);
-pub struct ReservationId(Uuid);
-pub struct UsageRecordId(Uuid);
-pub struct AuditEventId(Uuid);
-```
+A logical inference execution can have multiple provider attempts. Provider attempts must not become independent financial executions.
 
-Identifiers should be generated using UUIDs or another consistently selected identifier strategy.
+Budget reservations and ledger entries require transactional consistency with their persistence operations.
 
-### 5.2 Money
+# 5. Core Entities
 
-Financial values must use decimal arithmetic or integer minor units.
+## 5.1 Tenant
 
-Never use floating-point arithmetic for authoritative financial accounting.
+Represents an organization using the gateway.
 
-```rust
-pub struct Money {
-    pub amount_minor: i64,
-    pub currency: Currency,
-}
-```
+Attributes:
 
-Example:
+| Attribute | Type | Description |
+|---|---|---|
+| id | TenantId | Unique identifier |
+| name | String | Organization name |
+| status | TenantStatus | Active, suspended, deleted |
+| created_at | DateTime | Creation time |
+| updated_at | DateTime | Last update |
 
-```text
-amount_minor = 10000
-currency = USD
-```
+Invariants:
 
-Represents USD 100.00.
+- Tenant IDs are globally unique.
+- Suspended tenants cannot execute inference.
+- Tenant ownership must be checked for every tenant-scoped operation.
+- Tenant identity must not be trusted from an unverified request field.
 
-Pricing calculations must also define precision and rounding rules.
+## 5.2 Project
 
-### 5.3 Token Usage
+Represents an application or workload within a tenant.
 
-```rust
-pub struct TokenUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub total_tokens: u64,
-}
-```
+Attributes:
 
-The domain must distinguish provider-reported usage from estimated usage.
+- ProjectId
+- TenantId
+- Name
+- Status
+- CreatedAt
+- UpdatedAt
 
-### 5.4 Time Window
-
-```rust
-pub struct TimeWindow {
-    pub starts_at: DateTime<Utc>,
-    pub ends_at: DateTime<Utc>,
-}
-```
-
-Used by budgets, rate-limit policies, and reporting periods.
-
-### 5.5 Model Capabilities
-
-```rust
-pub enum ModelCapability {
-    TextGeneration,
-    Streaming,
-    ToolCalling,
-    StructuredOutput,
-    JsonMode,
-    Vision,
-    Embeddings,
-    AudioInput,
-    AudioOutput,
-}
-```
-
-Capabilities must be extensible without changing inference business rules unnecessarily.
-
-### 5.6 Other Value Objects
-
-| Value Object | Responsibility |
-|---|---|
-| EmailAddress | Validated email |
-| ApiKeyPrefix | Non-secret identifier prefix |
-| ApiKeyHash | Cryptographic hash of a virtual API key |
-| SecretReference | Reference to an external secret |
-| ModelName | Provider-independent model identifier |
-| ProviderName | Provider identifier |
-| IdempotencyKey | Client-supplied request deduplication key |
-| RequestFingerprint | Normalized request hash |
-| RoutingReason | Explanation of model selection |
-| Latency | Duration measurement |
-| CostEstimate | Estimated inference cost |
-| CostBreakdown | Input/output/cached token cost |
-| TokenLimit | Maximum allowed token count |
-| SimilarityScore | Semantic cache similarity score |
-
----
-
-# 6. Tenant Management Context
-
-## 6.1 Tenant
-
-A tenant represents an organization or customer using the gateway.
-
-**Attributes**
-
-| Attribute | Type |
-|---|---|
-| id | TenantId |
-| name | String |
-| slug | String |
-| status | TenantStatus |
-| created_at | DateTime |
-| updated_at | DateTime |
-
-**TenantStatus**
-
-```rust
-pub enum TenantStatus {
-    Active,
-    Suspended,
-    Disabled,
-}
-```
-
-**Invariants**
-
-- Tenant slug must be unique.
-- A suspended tenant cannot execute new inference requests.
-- Tenant-owned resources must not be accessible by another tenant.
-- Tenant deletion must respect retention and audit requirements.
-
-## 6.2 Project
-
-A project groups API keys, configurations, usage, and inference workloads inside a tenant.
-
-**Attributes**
-
-| Attribute | Type |
-|---|---|
-| id | ProjectId |
-| tenant_id | TenantId |
-| name | String |
-| description | Option<String> |
-| status | ProjectStatus |
-| created_at | DateTime |
-
-**ProjectStatus**
-
-```rust
-pub enum ProjectStatus {
-    Active,
-    Suspended,
-    Archived,
-}
-```
-
-**Invariants**
+Invariants:
 
 - Every project belongs to exactly one tenant.
-- Project ownership cannot be changed through ordinary updates.
-- Suspended projects cannot execute inference requests.
+- A project cannot reference a different tenant's API key.
+- Project-level policies may narrow tenant-level permissions but cannot override mandatory platform restrictions.
 
-## 6.3 Membership
+## 5.3 API Key
 
-Represents a user's membership in a tenant.
-
-Attributes:
-
-- id
-- tenant_id
-- user_id
-- status
-- joined_at
-
-A user may belong to multiple tenants.
-
----
-
-# 7. Identity and Access Context
-
-## 7.1 User
-
-Represents a human administrator or developer.
+Represents a credential used by client applications.
 
 Attributes:
 
-- id
-- email
-- display_name
-- status
-- created_at
-- updated_at
+- APIKeyId
+- TenantId
+- ProjectId (optional)
+- KeyHash
+- KeyPrefix
+- Scopes
+- ExpiresAt
+- RevokedAt
+- CreatedAt
+- LastUsedAt
 
-The initial API key authentication flow does not require the user to be present in every inference request. The API key resolves to its associated tenant and project identity.
+Invariants:
 
-## 7.2 Role
+- Raw API keys are returned only at creation or rotation.
+- Raw keys are never persisted.
+- Revoked and expired keys cannot authenticate.
+- API keys cannot grant permissions beyond their assigned scope.
+- Rotation creates a new credential and supports controlled revocation of the old credential.
 
-Defines a named set of permissions.
+## 5.4 Policy
 
-Initial roles:
+Represents an enforceable set of gateway rules.
 
-| Role | Scope |
-|---|---|
-| PlatformAdmin | Platform |
-| TenantAdmin | Tenant |
-| ProjectAdmin | Project |
-| Developer | Project |
-| Auditor | Tenant or project |
+Policy categories:
 
-Roles should be assigned at an explicit scope.
-
-## 7.3 Permission
-
-Represents an authorized action.
-
-Examples:
-
-```text
-inference:create
-inference:read
-apikey:create
-apikey:revoke
-budget:read
-budget:update
-policy:read
-policy:update
-model:read
-model:update
-audit:read
-tenant:manage
-```
-
-Authorization must verify both the permission and the resource scope.
-
-## 7.4 ApiKey
-
-Represents a virtual API credential issued by the gateway.
+- Access policy.
+- Model allowlist.
+- Provider allowlist.
+- Data residency policy.
+- Budget policy.
+- Rate-limit policy.
+- Cache policy.
+- Content and safety policy.
 
 Attributes:
 
-| Attribute | Type |
-|---|---|
-| id | ApiKeyId |
-| tenant_id | TenantId |
-| project_id | ProjectId |
-| name | String |
-| key_prefix | ApiKeyPrefix |
-| key_hash | ApiKeyHash |
-| scopes | Set<Permission> |
-| status | ApiKeyStatus |
-| expires_at | Option<DateTime> |
-| last_used_at | Option<DateTime> |
-| created_at | DateTime |
-| revoked_at | Option<DateTime> |
+- PolicyId
+- Scope
+- ScopeId
+- Version
+- Configuration
+- Status
+- EffectiveAt
 
-**ApiKeyStatus**
+Invariants:
 
-```rust
-pub enum ApiKeyStatus {
-    Active,
-    Expired,
-    Revoked,
-}
-```
+- Policy versions are identifiable and auditable.
+- Mandatory platform restrictions cannot be bypassed by tenant configuration.
+- Policy evaluation produces an explainable decision.
+- Policy changes must not silently rewrite historical execution decisions.
 
-**Invariants**
+# 6. Model and Provider Domain
 
-- Raw API keys are shown only once at creation.
-- Only the hash is persisted.
-- Revoked keys cannot authenticate requests.
-- Expired keys cannot authenticate requests.
-- An API key belongs to one project and one tenant.
-- Scopes cannot exceed the permissions granted by the issuing administrator.
+## 6.1 Provider
 
-**Lifecycle**
-
-```mermaid
-stateDiagram-v2
-    [*] --> Active
-    Active --> Expired
-    Active --> Revoked
-    Expired --> Revoked
-    Revoked --> [*]
-```
-
----
-
-# 8. Security and Secret Management Context
-
-## 8.1 SecretReference
-
-Represents the location of a provider credential in an external secret manager.
+Represents an external or self-hosted model provider.
 
 Attributes:
 
-| Attribute | Type |
-|---|---|
-| id | UUID |
-| provider_id | ProviderId |
-| secret_name | String |
-| secret_version | Option<String> |
-| status | SecretReferenceStatus |
-| created_at | DateTime |
-| updated_at | DateTime |
-
-**SecretReferenceStatus**
-
-```rust
-pub enum SecretReferenceStatus {
-    Active,
-    RotationPending,
-    Disabled,
-}
-```
-
-Important distinction:
-
-- `ApiKey` represents a virtual credential issued to gateway customers.
-- `SecretReference` represents a reference to a provider credential.
-- The actual provider credential is not a domain entity and must not be persisted in the gateway's ordinary domain tables.
-
-## 8.2 SecurityPolicy
-
-Represents security constraints applicable to a tenant or project.
-
-Examples:
-
-- Allowed data regions.
-- PII redaction requirements.
-- Prompt logging restrictions.
-- Provider restrictions.
-- Retention requirements.
-- Sensitive-data handling rules.
-
----
-
-# 9. Policy Management Context
-
-## 9.1 Policy
-
-A policy defines operational and business constraints.
-
-Attributes:
-
-- id
-- tenant_id
-- project_id
-- name
-- version
-- status
-- effective_from
-- created_at
-- updated_at
-
-Policy types:
-
-```rust
-pub enum PolicyType {
-    ModelAccess,
-    ProviderAccess,
-    Security,
-    Routing,
-    RateLimit,
-    Concurrency,
-    Budget,
-    Cache,
-    Retention,
-}
-```
-
-A policy may contain multiple typed rules, but rule validation and execution must remain explicit.
-
-**Invariants**
-
-- Policy versions must be identifiable.
-- Changes must be auditable.
-- A request must use a consistent policy version for its admission decision.
-- A policy must not silently expand permissions.
-
-## 9.2 PolicyDecision
-
-A policy decision is an immutable result of evaluating a request against applicable rules.
-
-Attributes:
-
-- id
-- request_id
-- policy_version
-- outcome
-- reason_codes
-- evaluated_at
-
-```rust
-pub enum PolicyOutcome {
-    Allow,
-    Deny,
-}
-```
-
-A decision must provide machine-readable reason codes.
-
----
-
-# 10. Traffic Management Context
-
-Traffic management includes two independent concepts: rate limiting and concurrency control.
-
-## 10.1 RateLimitPolicy
-
-Defines how frequently requests or tokens may be consumed.
-
-Attributes:
-
-- id
-- scope
-- scope_id
-- dimension
-- capacity
-- refill_rate
-- window
-- algorithm
-- enabled
-
-**RateLimitDimension**
-
-```rust
-pub enum RateLimitDimension {
-    Requests,
-    InputTokens,
-    OutputTokens,
-    TotalTokens,
-}
-```
-
-**RateLimitAlgorithm**
-
-```rust
-pub enum RateLimitAlgorithm {
-    TokenBucket,
-    SlidingWindow,
-}
-```
-
-Example:
-
-```text
-Scope: Project
-Dimension: Requests
-Capacity: 300
-Window: 60 seconds
-Algorithm: Token Bucket
-```
-
-The domain describes the rule. Redis implements distributed admission state.
-
-## 10.2 RateLimitDecision
-
-Attributes:
-
-- request_id
-- outcome
-- remaining_capacity
-- retry_after
-- evaluated_at
-
-```rust
-pub enum AdmissionOutcome {
-    Allowed,
-    Rejected,
-}
-```
-
-## 10.3 ConcurrencyPolicy
-
-Defines the maximum number of simultaneous executions.
-
-Attributes:
-
-- id
-- scope
-- scope_id
-- max_concurrent_requests
-- enabled
-
-Example:
-
-```text
-Tenant: tenant-001
-Maximum concurrent requests: 100
-```
-
-## 10.4 ConcurrencyLease
-
-Represents temporary ownership of one concurrency permit.
-
-Attributes:
-
-- id
-- request_id
-- scope_id
-- acquired_at
-- expires_at
-- released_at
-
-A lease must be released on completion, failure, or cancellation.
-
-Expired leases require recovery so crashed workers do not permanently consume capacity.
-
-**Important distinction**
-
-| Concept | Controls | Example |
-|---|---|---|
-| Rate limit | Consumption over time | 100 requests/min |
-| Concurrency | Simultaneous execution | 20 active requests |
-| Budget | Financial expenditure | $500/month |
-
-None of these controls should be treated as a substitute for another.
-
----
-
-# 11. Financial Management Context
-
-## 11.1 Budget
-
-Represents an authorized financial spending limit.
-
-Attributes:
-
-| Attribute | Type |
-|---|---|
-| id | BudgetId |
-| tenant_id | TenantId |
-| project_id | Option<ProjectId> |
-| name | String |
-| limit | Money |
-| period | BudgetPeriod |
-| spent_amount | Money |
-| reserved_amount | Money |
-| status | BudgetStatus |
-| starts_at | DateTime |
-| ends_at | DateTime |
-
-**BudgetPeriod**
-
-```rust
-pub enum BudgetPeriod {
-    Daily,
-    Weekly,
-    Monthly,
-    Custom,
-}
-```
-
-**BudgetStatus**
-
-```rust
-pub enum BudgetStatus {
-    Active,
-    Suspended,
-    Exhausted,
-    Expired,
-}
-```
-
-**Budget invariants**
-
-- A budget cannot authorize spending beyond its configured limit.
-- Reservations must be atomic.
-- Settlements must be idempotent.
-- Releasing a reservation must not create negative reserved balances.
-- Currency must be consistent within an individual budget.
-- Budget updates must be auditable.
-
-Available amount:
-
-\[
-Available = Limit - Spent - Reserved
-\]
-
-A new reservation is allowed only when the required amount does not exceed the available amount, subject to the configured overage policy.
-
-## 11.2 BudgetReservation
-
-Represents a temporary financial commitment for an inference execution.
-
-Attributes:
-
-- id
-- budget_id
-- execution_id
-- estimated_cost
-- actual_cost
-- status
-- reserved_at
-- settled_at
-
-**ReservationStatus**
-
-```rust
-pub enum ReservationStatus {
-    Reserved,
-    Settled,
-    Released,
-    Expired,
-}
-```
-
-Lifecycle:
-
-```mermaid
-stateDiagram-v2
-    [*] --> Reserved
-    Reserved --> Settled
-    Reserved --> Released
-    Reserved --> Expired
-    Settled --> [*]
-    Released --> [*]
-    Expired --> [*]
-```
-
-**Financial invariants**
-
-- A reservation must exist before provider execution when budget enforcement is required.
-- Settlement must be idempotent.
-- A reservation must not be settled twice.
-- The estimated cost and actual cost must be distinguishable.
-- Failed executions must follow a defined reservation release or reconciliation policy.
-- Budget settlement must be transactionally consistent with usage accounting.
-
-## 11.3 BudgetThreshold
-
-Defines warning thresholds.
-
-Examples:
-
-- 50% consumed.
-- 80% consumed.
-- 95% consumed.
-- 100% consumed.
-
-Threshold notifications should be event-driven.
-
----
-
-# 12. Model Management Context
-
-## 12.1 Provider
-
-Represents an external or internal inference provider.
-
-Attributes:
-
-- id
-- name
-- provider_type
-- status
-- base_endpoint
-- region
-- secret_reference_id
-- created_at
-
-**ProviderType**
-
-```rust
-pub enum ProviderType {
-    OpenAI,
-    Anthropic,
-    Vllm,
-    Ollama,
-    Custom,
-}
-```
-
-**ProviderStatus**
-
-```rust
-pub enum ProviderStatus {
-    Active,
-    Degraded,
-    Unavailable,
-    Disabled,
-}
-```
-
-Provider endpoint configuration must be validated and controlled. Secret values are resolved separately.
-
-## 12.2 Model
+- ProviderId
+- Name
+- ProviderType
+- EndpointReference
+- CredentialReference
+- Status
+- ConfigurationVersion
+
+Provider types:
+
+- Commercial API.
+- OpenAI-compatible API.
+- Self-hosted inference service.
+
+The domain stores secret references, not provider credentials.
+
+## 6.2 Model
 
 Represents a model exposed through a provider.
 
 Attributes:
 
-- id
-- provider_id
-- model_name
-- display_name
-- capabilities
-- context_window
-- max_output_tokens
-- status
-- pricing_id
+- ModelId
+- ProviderId
+- ProviderModelName
+- DisplayName
+- Capabilities
+- ContextWindow
+- MaximumOutputTokens
+- PricingReference
+- AvailabilityStatus
+- ModelVersion
 
-**ModelStatus**
+Capabilities include:
 
-```rust
-pub enum ModelStatus {
-    Active,
-    Deprecated,
-    Disabled,
-}
-```
+- Text generation.
+- Streaming.
+- Tool calling.
+- Structured output.
+- JSON mode.
+- Image input.
+- Audio input.
+- Embeddings.
 
-A provider may expose multiple models.
+Invariants:
 
-## 12.3 ModelPricing
+- A model belongs to one provider configuration.
+- A model must advertise the capabilities required by a request.
+- Disabled models cannot be selected for new executions.
+- Pricing must have a version and effective period.
+- Missing pricing must never be interpreted as zero cost.
 
-Represents a versioned pricing configuration.
+## 6.3 Model Pricing
 
-Attributes:
-
-- id
-- model_id
-- currency
-- input_price_per_million_tokens
-- output_price_per_million_tokens
-- cached_input_price_per_million_tokens
-- effective_from
-- effective_until
-
-Pricing changes must be versioned so historical inference costs can be explained.
-
-Actual provider billing information may differ from estimates. The accounting model must preserve that distinction.
-
-## 12.4 ProviderHealth
-
-Represents the operational health of a provider or model endpoint.
+Pricing is versioned independently from model metadata.
 
 Attributes:
 
-- provider_id
-- model_id
-- health_status
-- consecutive_failures
-- last_success_at
-- last_failure_at
-- updated_at
+- PricingId
+- ModelId
+- Version
+- Currency
+- InputTokenPrice
+- OutputTokenPrice
+- CachedInputTokenPrice (optional)
+- EffectiveFrom
+- EffectiveUntil
 
-Health status:
+Additional pricing dimensions may include image, audio, tool, and batch usage.
 
-```rust
-pub enum HealthStatus {
-    Healthy,
-    Degraded,
-    Unavailable,
-    Unknown,
-}
-```
+Pricing calculations must use decimal arithmetic, not binary floating-point arithmetic.
 
-Operational health state may be stored in Redis, with durable historical records retained when required.
+# 7. Inference Domain
 
----
+## 7.1 Inference Request
 
-# 13. Routing Context
-
-## 13.1 RoutingRule
-
-Defines the conditions under which a model may be selected.
+Represents the normalized intent submitted by a client.
 
 Attributes:
 
-- id
-- tenant_id
-- project_id
-- priority
-- conditions
-- preferred_models
-- fallback_models
-- status
-- version
+- RequestId
+- TenantId
+- ProjectId
+- APIKeyId
+- RequestedModel
+- Messages
+- GenerationParameters
+- RequestedCapabilities
+- Streaming
+- IdempotencyKey
+- ReceivedAt
 
-Possible routing dimensions:
+The domain request is independent of provider-specific HTTP schemas.
 
-- Task type.
-- Model capability.
-- Context length.
-- Maximum cost.
-- Latency objective.
-- Quality requirement.
-- Data residency.
-- Provider health.
-- Tenant policy.
+## 7.2 Inference Execution
 
-## 13.2 RoutingDecision
-
-Represents an immutable model-selection result.
+Represents one logical attempt to fulfill an inference request.
 
 Attributes:
 
-- id
-- execution_id
-- selected_provider_id
-- selected_model_id
-- candidate_models
-- rejected_candidates
-- routing_reason
-- estimated_cost
-- policy_version
-- decided_at
+- ExecutionId
+- RequestId
+- TenantId
+- ProjectId
+- SelectedModelId
+- Status
+- RoutingDecisionId
+- ReservationId
+- StartedAt
+- CompletedAt
+- FailureCode
 
-Routing decisions should explain why the selected model was eligible and why relevant alternatives were rejected.
+An execution may contain multiple provider attempts.
 
-Example:
+Execution states:
 
-```text
-Selected model: Model B
-
-Reasons:
-- Supports required tool calling.
-- Satisfies context-window requirement.
-- Provider is healthy.
-- Within tenant budget.
-- Meets configured latency objective.
-
-Rejected:
-- Model A: context window insufficient.
-- Model C: provider unavailable.
-- Model D: exceeds maximum cost.
-```
-
----
-
-# 14. Inference Context
-
-## 14.1 InferenceRequest
-
-Represents the normalized request submitted by a client.
-
-Attributes:
-
-- id
-- tenant_id
-- project_id
-- api_key_id
-- idempotency_key
-- requested_model
-- request_fingerprint
-- request_status
-- created_at
-
-The request may contain prompt and generation parameters in a protected request payload, but domain identity and metadata should remain separate.
-
-## 14.2 InferenceExecution
-
-Represents an actual attempt to fulfill an inference request.
-
-A request can have one or more executions when the idempotency and retry policies permit it.
-
-Attributes:
-
-- id
-- request_id
-- routing_decision_id
-- execution_status
-- started_at
-- completed_at
-- latency
-- usage_record_id
-
-**ExecutionStatus**
-
-```rust
-pub enum ExecutionStatus {
-    Pending,
-    Running,
-    Completed,
-    Failed,
-    Cancelled,
-    TimedOut,
-    PartiallyCompleted,
-}
-```
-
-## 14.3 ProviderAttempt
-
-Represents an individual call to a provider.
-
-Attributes:
-
-- id
-- execution_id
-- provider_id
-- model_id
-- attempt_number
-- status
-- provider_request_id
-- error_code
-- started_at
-- completed_at
-- latency
-
-A single execution may contain multiple provider attempts when retries or fallbacks are allowed.
-
-## 14.4 IdempotencyRecord
-
-Prevents unintended duplicate execution for repeated client requests.
-
-Attributes:
-
-- id
-- tenant_id
-- project_id
-- idempotency_key
-- request_fingerprint
-- request_id
-- status
-- expires_at
-
-**Invariants**
-
-- An idempotency key must be scoped to a tenant and project.
-- Reusing the same key with a different request fingerprint must be rejected.
-- Concurrent requests using the same key must not produce duplicate execution.
-- The system must define behavior for requests still in progress.
-- Idempotency retention must be configurable.
-
-Idempotency is not a guarantee of exactly-once execution at the external provider. The gateway must account for uncertain provider outcomes and avoid unsafe retries.
-
----
-
-# 15. Cache Context
-
-## 15.1 CacheEntry
-
-Represents a reusable inference response.
-
-Attributes:
-
-- id
-- tenant_id
-- project_id
-- cache_type
-- request_fingerprint
-- response_reference
-- model_id
-- model_configuration_hash
-- expires_at
-- created_at
-
-**CacheType**
-
-```rust
-pub enum CacheType {
-    Exact,
-    Semantic,
-}
-```
-
-For semantic cache entries, additional metadata may include:
-
-- embedding model version.
-- similarity threshold.
-- embedding reference.
-- normalized request representation.
-
-**Cache invariants**
-
-- Cache lookup must respect tenant and project isolation.
-- Authorization must be verified before serving cached data.
-- Model and generation parameters must be compatible.
-- Sensitive data must not enter cache unless explicitly permitted.
-- Expired entries cannot be served.
-- Cache invalidation must account for model and prompt configuration changes.
-
----
-
-# 16. Usage Accounting Context
-
-## 16.1 UsageRecord
-
-Represents consumption associated with an inference execution.
-
-Attributes:
-
-| Attribute | Type |
+| State | Meaning |
 |---|---|
-| id | UsageRecordId |
-| execution_id | ExecutionId |
-| tenant_id | TenantId |
-| project_id | ProjectId |
-| provider_id | ProviderId |
-| model_id | ModelId |
-| token_usage | TokenUsage |
-| estimated_cost | Money |
-| actual_cost | Option<Money> |
-| cost_source | CostSource |
-| recorded_at | DateTime |
+| Received | Request accepted by the application boundary |
+| Admitted | Required admission checks passed |
+| Reserved | Required financial reservation created |
+| Executing | Provider execution started |
+| Completed | Complete successful response received |
+| Failed | Execution failed with a known outcome |
+| Cancelled | Execution cancelled |
+| UnknownOutcome | Provider outcome cannot yet be determined |
+| ReconciliationPending | Requires reconciliation |
+| Reconciled | Unknown outcome has been resolved |
 
-**CostSource**
+State transitions must be validated. Terminal states must not be overwritten by duplicate events.
 
-```rust
-pub enum CostSource {
-    Estimated,
-    ProviderReported,
-    Reconciled,
-}
-```
+## 7.3 Provider Attempt
 
-**Invariants**
-
-- Usage records must reference an execution.
-- Usage records must not be duplicated during retry or event replay.
-- Estimated and actual costs must be distinguishable.
-- Historical usage must retain the pricing version used for calculation.
-- Corrections must be auditable.
-
----
-
-# 17. Audit Context
-
-## 17.1 AuditEvent
-
-Represents a security-sensitive or administrative action.
+Represents one provider execution within a logical execution.
 
 Attributes:
 
-- id
-- tenant_id
-- actor_type
-- actor_id
-- action
-- resource_type
-- resource_id
-- outcome
-- correlation_id
-- metadata
-- occurred_at
+- AttemptId
+- ExecutionId
+- ProviderId
+- ModelId
+- AttemptNumber
+- Status
+- StartedAt
+- CompletedAt
+- ProviderRequestId
+- ErrorCode
+- InputTokens
+- OutputTokens
+- LatencyMs
+
+Attempt states:
+
+- Pending
+- Started
+- Succeeded
+- Failed
+- TimedOut
+- Cancelled
+- UnknownOutcome
+
+Invariants:
+
+- Each attempt belongs to one execution.
+- Attempt numbers are unique within an execution.
+- Every retry creates a new attempt.
+- Provider failures are normalized before reaching application-level logic.
+- An uncertain outcome remains distinguishable from a confirmed failure.
+
+## 7.4 Routing Decision
+
+Represents the decision to select a model.
+
+Attributes:
+
+- RoutingDecisionId
+- ExecutionId
+- RequestedModel
+- SelectedModelId
+- Strategy
+- CandidateModels
+- RejectedCandidates
+- DecisionReason
+- PolicyVersion
+- PricingVersion
+- CreatedAt
+
+Invariants:
+
+- Hard eligibility constraints are evaluated before ranking.
+- A rejected model must have a recorded rejection reason.
+- The selected model must satisfy mandatory policy constraints.
+- Historical decisions must remain explainable using their recorded versions.
+
+# 8. Budget and Financial Domain
+
+## 8.1 Budget Account
+
+Represents a spending limit for a particular scope and period.
+
+Scopes:
+
+- Platform.
+- Tenant.
+- Project.
+- API key.
+
+Attributes:
+
+- BudgetAccountId
+- Scope
+- ScopeId
+- LimitAmount
+- Currency
+- Period
+- PeriodStart
+- PeriodEnd
+- Status
+
+Invariants:
+
+- A budget account has one currency.
+- Spending cannot be admitted when the required budget is unavailable.
+- Applicable parent and child budget constraints must both be respected.
+- Budget limits cannot be bypassed by selecting a different provider.
+
+Available budget:
+
+\[
+Available = Limit - ActualSpend - ActiveReservations
+\]
+
+## 8.2 Budget Reservation
+
+Represents an amount reserved before provider execution.
+
+Attributes:
+
+- ReservationId
+- ExecutionId
+- BudgetAccountId
+- ReservedAmount
+- Currency
+- Status
+- CreatedAt
+- SettledAt
+- ReleasedAt
+
+States:
+
+- Pending
+- Active
+- Rejected
+- Settled
+- Released
+- Expired
+- ReconciliationPending
+
+Invariants:
+
+- Reservations are associated with a logical execution.
+- A reservation cannot be settled more than once.
+- Repeated settlement commands must be idempotent.
+- Uncertain provider outcomes must not automatically release reservations.
+- Actual provider cost must be recorded even if it exceeds the original reservation.
+
+## 8.3 Usage Record
+
+Represents normalized usage for an execution or provider attempt.
+
+Attributes:
+
+- UsageRecordId
+- ExecutionId
+- AttemptId
+- ModelId
+- InputTokens
+- OutputTokens
+- CachedInputTokens
+- Currency
+- EstimatedCost
+- ActualCost
+- UsageSource
+- RecordedAt
+
+Usage sources:
+
+- ProviderReported.
+- GatewayEstimated.
+- Reconciled.
+
+A usage record must distinguish estimated usage from provider-reported usage.
+
+## 8.4 Financial Ledger Entry
+
+Represents an immutable financial movement.
+
+Attributes:
+
+- LedgerEntryId
+- BudgetAccountId
+- ExecutionId
+- ReservationId
+- EntryType
+- Amount
+- Currency
+- CreatedAt
+- ReferenceId
+
+Entry types:
+
+- Reservation.
+- Settlement.
+- Release.
+- Adjustment.
+- Reconciliation.
+
+Invariants:
+
+- Ledger entries are append-only.
+- Corrections use compensating entries.
+- Financial amounts use decimal arithmetic.
+- Every entry has a traceable business reference.
+- Ledger updates and corresponding accounting state changes must be transactionally consistent.
+
+# 9. Admission Control Domain
+
+Admission control determines whether a request can proceed.
+
+It includes separate controls:
+
+| Control | Protects Against |
+|---|---|
+| Rate limit | Excessive request or token rate |
+| Concurrency limit | Excessive active executions |
+| Budget limit | Financial exposure |
+| Abuse protection | Malicious or anomalous usage |
+| Provider quota | Provider-specific capacity exhaustion |
+
+These controls are related but are not interchangeable.
+
+Domain decisions should be represented explicitly:
+
+- AdmissionDecision
+- RateLimitDecision
+- ConcurrencyDecision
+- BudgetDecision
+
+Redis and PostgreSQL implementations belong to infrastructure.
+
+# 10. Cache Domain
+
+The cache domain defines whether an execution can use or populate a cache.
+
+Cache types:
+
+- Exact cache.
+- Semantic cache.
+
+Cache eligibility must consider:
+
+- Tenant and project isolation.
+- Authorization.
+- Model and model version.
+- Prompt and policy version.
+- Generation parameters.
+- Tool configuration.
+- Data sensitivity.
+- Response completeness.
+- TTL and invalidation rules.
+
+A cache hit does not represent a provider execution.
+
+It may still represent a billable gateway operation under a future commercial pricing policy, but it must not be counted as provider token expenditure.
+
+Semantic cache activation requires evaluation evidence and explicit policy approval.
+
+# 11. Audit Domain
+
+An audit event represents an important security or administrative action.
+
+Attributes:
+
+- AuditEventId
+- ActorId
+- TenantId
+- ProjectId
+- Action
+- ResourceType
+- ResourceId
+- Outcome
+- Timestamp
+- CorrelationId
 
 Examples:
 
-```text
-API_KEY_CREATED
-API_KEY_REVOKED
-POLICY_UPDATED
-BUDGET_UPDATED
-SECRET_REFERENCE_ROTATED
-TENANT_SUSPENDED
-AUTHORIZATION_DENIED
-MODEL_CONFIGURATION_CHANGED
-```
+- API key created.
+- API key revoked.
+- Tenant suspended.
+- Budget modified.
+- Provider configuration changed.
+- Model enabled or disabled.
+- Policy updated.
+- Administrative access denied.
 
-Audit events should be append-oriented.
+Audit events must not contain raw credentials or unnecessary sensitive prompt content.
 
-Ordinary application updates must not silently rewrite historical audit events.
+# 12. Value Objects
 
----
+Use strongly typed value objects to prevent invalid domain states.
 
-# 18. Evaluation Context
-
-## 18.1 EvaluationDataset
-
-Represents a versioned collection of evaluation examples.
-
-Attributes:
-
-- id
-- name
-- version
-- description
-- dataset_type
-- created_at
-
-## 18.2 EvaluationRun
-
-Represents a batch evaluation execution.
-
-Attributes:
-
-- id
-- dataset_id
-- dataset_version
-- model_id
-- evaluation_status
-- started_at
-- completed_at
-- configuration_version
-
-## 18.3 EvaluationResult
-
-Represents the result of evaluating an inference output.
-
-Attributes:
-
-- id
-- evaluation_run_id
-- execution_id
-- metric_name
-- score
-- threshold
-- outcome
-- evaluated_at
-
-Possible metrics:
-
-- Answer relevance.
-- Faithfulness.
-- Context relevance.
-- Toxicity.
-- Safety.
-- Structured output validity.
-- Task-specific correctness.
-
-Evaluation scores must be interpreted according to the metric definition and dataset version. An LLM judge score is not proof of correctness.
-
----
-
-# 19. Aggregate Boundaries
-
-Aggregates define transactional consistency boundaries.
-
-| Aggregate Root | Owned Concepts | Primary Invariants |
-|---|---|---|
-| Tenant | Tenant configuration | Tenant lifecycle |
-| Project | Project configuration | Tenant ownership |
-| ApiKey | Key metadata and scopes | Key lifecycle and revocation |
-| Policy | Policy rules and versions | Valid policy transitions |
-| Budget | Reservations and settlements | No unauthorized overspending |
-| Provider | Provider configuration and model references | Provider configuration validity |
-| Model | Model capabilities and pricing references | Valid model configuration |
-| InferenceRequest | Request identity and idempotency | Duplicate request protection |
-| InferenceExecution | Provider attempts and execution lifecycle | Valid execution transitions |
-| RoutingDecision | Candidate evaluation and selection | Explainable selection |
-| EvaluationRun | Evaluation results | Consistent evaluation lifecycle |
-
-Some large collections, such as usage records and audit events, should not be loaded into aggregates. They should be handled through dedicated repositories and application services.
-
-Aggregate boundaries are logical consistency boundaries, not instructions to create one SQL table per aggregate.
-
----
-
-# 20. Domain Relationships
-
-```mermaid
-erDiagram
-    TENANT ||--o{ PROJECT : owns
-    TENANT ||--o{ MEMBERSHIP : has
-    USER ||--o{ MEMBERSHIP : joins
-    PROJECT ||--o{ API_KEY : issues
-
-    TENANT ||--o{ POLICY : configures
-    PROJECT ||--o{ POLICY : overrides
-    POLICY ||--o{ RATE_LIMIT_POLICY : defines
-    POLICY ||--o{ CONCURRENCY_POLICY : defines
-
-    TENANT ||--o{ BUDGET : owns
-    PROJECT ||--o{ BUDGET : may_have
-    BUDGET ||--o{ BUDGET_RESERVATION : contains
-
-    PROVIDER ||--o{ MODEL : exposes
-    PROVIDER ||--o{ SECRET_REFERENCE : uses
-    MODEL ||--o{ ROUTING_RULE : eligible_for
-
-    PROJECT ||--o{ INFERENCE_REQUEST : submits
-    INFERENCE_REQUEST ||--o{ INFERENCE_EXECUTION : produces
-    INFERENCE_EXECUTION ||--o{ PROVIDER_ATTEMPT : contains
-    INFERENCE_EXECUTION ||--o| ROUTING_DECISION : uses
-    INFERENCE_EXECUTION ||--o| USAGE_RECORD : produces
-    INFERENCE_EXECUTION ||--o| BUDGET_RESERVATION : reserves
-
-    TENANT ||--o{ AUDIT_EVENT : generates
-    EVALUATION_DATASET ||--o{ EVALUATION_RUN : evaluates
-    EVALUATION_RUN ||--o{ EVALUATION_RESULT : produces
-```
-
----
-
-# 21. Core Domain Invariants
-
-The following invariants must be enforced regardless of the API endpoint or infrastructure implementation.
-
-## Security invariants
-
-1. A request must be authenticated before execution.
-2. Authentication does not imply authorization.
-3. Tenant and project ownership must be checked.
-4. Revoked or expired API keys cannot authenticate.
-5. Provider credentials must not be exposed to clients.
-6. Secret values must not appear in logs, traces, or audit metadata.
-7. Cross-tenant cache access is prohibited.
-
-## Admission invariants
-
-1. Required validation must complete before provider execution.
-2. Rate-limit admission must succeed.
-3. Required concurrency capacity must be acquired.
-4. Required policy checks must pass.
-5. Required budget reservation must succeed.
-6. Idempotency must be checked before creating duplicate executions.
-
-## Financial invariants
-
-1. Budget reservations must be atomic.
-2. Budget settlement must be idempotent.
-3. Actual usage must be reconciled.
-4. Historical cost calculations must be reproducible.
-5. Financial values must not rely on floating-point arithmetic.
-
-## Inference invariants
-
-1. Each execution has a unique identifier.
-2. Every provider attempt belongs to an execution.
-3. Provider errors must be normalized.
-4. Fallback decisions must be traceable.
-5. Streaming cancellation must release resources.
-6. Provider retries must respect duplicate-execution risks.
-
----
-
-# 22. Domain Events
-
-Domain events represent significant business state changes.
-
-| Event | Trigger |
+| Value Object | Purpose |
 |---|---|
-| TenantCreated | New tenant |
-| TenantSuspended | Tenant suspended |
-| ProjectCreated | New project |
-| ApiKeyCreated | New virtual API key |
-| ApiKeyRevoked | API key revoked |
-| PolicyUpdated | Policy version changed |
-| BudgetCreated | New budget |
-| BudgetReservationCreated | Funds reserved |
-| BudgetReservationSettled | Actual cost reconciled |
-| BudgetThresholdReached | Threshold exceeded |
-| RateLimitExceeded | Request rejected |
-| InferenceRequested | Request accepted |
-| InferenceCompleted | Execution succeeded |
-| InferenceFailed | Execution failed |
-| ProviderAttemptFailed | Provider attempt failed |
-| RoutingDecisionMade | Model selected |
-| UsageRecorded | Usage persisted |
-| SecretReferenceRotated | Provider credential reference changed |
-| EvaluationRequested | Evaluation scheduled |
-| EvaluationCompleted | Evaluation finished |
+| TenantId | Tenant identifier |
+| ProjectId | Project identifier |
+| APIKeyId | API key identifier |
+| ProviderId | Provider identifier |
+| ModelId | Model identifier |
+| RequestId | API request identifier |
+| ExecutionId | Logical execution identifier |
+| AttemptId | Provider attempt identifier |
+| ReservationId | Financial reservation identifier |
+| Money | Amount and currency |
+| TokenCount | Non-negative token quantity |
+| Percentage | Valid bounded percentage |
+| TimeWindow | Valid start and end |
+| ModelCapabilities | Supported model capabilities |
+| GenerationParameters | Valid generation settings |
+| IdempotencyKey | Client operation identifier |
 
-Example event:
+Example:
 
 ```rust
-pub struct InferenceCompleted {
-    pub execution_id: ExecutionId,
-    pub tenant_id: TenantId,
-    pub project_id: ProjectId,
-    pub provider_id: ProviderId,
-    pub model_id: ModelId,
-    pub usage_record_id: UsageRecordId,
-    pub completed_at: DateTime<Utc>,
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExecutionId(uuid::Uuid);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TenantId(uuid::Uuid);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ModelId(uuid::Uuid);
 ```
 
-Domain events should contain identifiers and necessary metadata, not raw prompts, responses, or credentials by default.
+For financial amounts, use a decimal representation such as `rust_decimal::Decimal`.
 
----
+Do not use `f64` for financial accounting.
 
-# 23. Domain Services
+# 13. Domain Services
 
-Some business operations span multiple aggregates and therefore belong in domain or application services.
+Domain services coordinate domain rules that do not naturally belong to one entity.
 
 | Service | Responsibility |
 |---|---|
-| AuthorizationService | Evaluate scoped permissions |
-| PolicyEvaluationService | Evaluate applicable policy rules |
-| RateLimitEvaluationService | Evaluate rate-limit policy |
-| ConcurrencyAdmissionService | Acquire and release concurrency capacity |
-| BudgetReservationService | Reserve and settle budget |
-| CostCalculationService | Calculate estimated and actual cost |
+| RoutingPolicyEvaluator | Evaluate mandatory routing constraints |
 | ModelEligibilityService | Determine eligible models |
-| RoutingDecisionService | Select a model and explain the decision |
-| IdempotencyService | Prevent duplicate execution |
-| CacheEligibilityService | Determine whether caching is permitted |
-| UsageAccountingService | Record and reconcile usage |
+| CostEstimationService | Estimate inference cost |
+| BudgetPolicyEvaluator | Determine budget eligibility |
+| UsageReconciliationService | Reconcile estimated and actual usage |
+| CacheEligibilityService | Determine cache eligibility |
+| PolicyEvaluator | Evaluate applicable policy rules |
 
-Infrastructure adapters implement persistence and distributed coordination. These services should depend on application ports rather than directly on Redis, PostgreSQL, or HTTP clients.
+External operations such as calling a provider, accessing Redis, querying PostgreSQL, or retrieving a secret are not domain services. They belong behind application ports and infrastructure adapters.
 
----
+# 14. Domain Events
 
-# 24. Domain-to-Infrastructure Mapping
+Domain events represent meaningful business state transitions.
 
-| Domain Concept | Infrastructure Implementation |
+| Event | Trigger |
 |---|---|
-| Tenant / Project | PostgreSQL |
-| User / Membership | PostgreSQL |
-| ApiKey | PostgreSQL, hash only |
-| Role / Permission | PostgreSQL and authorization service |
-| SecretReference | PostgreSQL metadata + external secret manager |
-| Policy | PostgreSQL |
-| RateLimitPolicy | PostgreSQL configuration + Redis counters |
-| ConcurrencyPolicy | PostgreSQL configuration + Redis leases |
-| Budget | PostgreSQL |
-| BudgetReservation | PostgreSQL transactions |
-| Provider / Model | PostgreSQL |
-| ProviderHealth | Redis operational state + optional historical storage |
-| RoutingDecision | PostgreSQL and telemetry |
-| InferenceRequest | PostgreSQL |
-| InferenceExecution | PostgreSQL |
-| ProviderAttempt | PostgreSQL |
-| CacheEntry | Redis or dedicated cache infrastructure |
-| UsageRecord | PostgreSQL |
-| AuditEvent | Durable append-oriented storage |
-| EvaluationDataset | PostgreSQL or versioned dataset storage |
-| EvaluationResult | PostgreSQL |
+| TenantCreated | Tenant created |
+| ProjectCreated | Project created |
+| APIKeyCreated | API key created |
+| APIKeyRevoked | API key revoked |
+| PolicyUpdated | Policy version changed |
+| ModelRegistered | Model added |
+| ModelDisabled | Model disabled |
+| InferenceAdmitted | Request passed admission |
+| BudgetReserved | Budget reservation created |
+| RoutingDecisionMade | Model selected |
+| ProviderAttemptStarted | Provider attempt started |
+| ProviderAttemptCompleted | Provider attempt completed |
+| ProviderAttemptFailed | Provider attempt failed |
+| InferenceCompleted | Execution completed |
+| InferenceFailed | Execution failed |
+| UsageRecorded | Usage normalized |
+| BudgetSettled | Reservation settled |
+| CacheHit | Cached response returned |
+| AuditEventRecorded | Auditable action occurred |
 
-This mapping is a starting point. Physical schema design belongs in `docs/data-model.md`.
+Events must include:
 
----
+- Event ID.
+- Event type.
+- Schema version.
+- Aggregate ID.
+- Occurred-at timestamp.
+- Correlation identifiers.
 
-# 25. Definition of Done
+Events are delivered asynchronously through the event publishing infrastructure where appropriate.
+
+Financial state changes must be persisted transactionally before publishing corresponding events.
+
+# 15. Domain Invariants
+
+The following invariants are mandatory.
+
+| ID | Invariant |
+|---|---|
+| INV-001 | Every project belongs to exactly one tenant |
+| INV-002 | Every API key belongs to a tenant |
+| INV-003 | Suspended tenants cannot execute inference |
+| INV-004 | Tenant isolation applies to all tenant-scoped operations |
+| INV-005 | No provider execution occurs before required admission checks |
+| INV-006 | No provider execution occurs before required budget reservation |
+| INV-007 | Every provider attempt belongs to one logical execution |
+| INV-008 | Retry and fallback create distinct provider attempts |
+| INV-009 | A reservation cannot be settled more than once |
+| INV-010 | Financial ledger entries are immutable |
+| INV-011 | Unknown provider outcomes remain explicitly represented |
+| INV-012 | Missing pricing is never treated as zero |
+| INV-013 | Disabled models cannot be selected |
+| INV-014 | Cache entries cannot cross tenant boundaries |
+| INV-015 | Provider credentials never enter domain entities |
+| INV-016 | Financial accounting does not depend on trace sampling |
+| INV-017 | Delivered streaming output cannot be transparently restarted |
+| INV-018 | Domain rules do not depend on infrastructure implementations |
+
+# 16. Rust Implementation Guidelines
+
+Suggested domain module structure:
+
+```text
+crates/domain/src/
+├── lib.rs
+├── identity/
+│   ├── mod.rs
+│   ├── tenant.rs
+│   ├── project.rs
+│   └── api_key.rs
+├── policy/
+│   ├── mod.rs
+│   └── policy.rs
+├── model/
+│   ├── mod.rs
+│   ├── provider.rs
+│   ├── model.rs
+│   └── pricing.rs
+├── inference/
+│   ├── mod.rs
+│   ├── request.rs
+│   ├── execution.rs
+│   ├── attempt.rs
+│   └── routing_decision.rs
+├── budget/
+│   ├── mod.rs
+│   ├── account.rs
+│   ├── reservation.rs
+│   └── ledger.rs
+├── usage/
+│   ├── mod.rs
+│   └── usage_record.rs
+├── cache/
+│   ├── mod.rs
+│   └── cache_policy.rs
+├── audit/
+│   ├── mod.rs
+│   └── audit_event.rs
+├── value_objects/
+│   ├── mod.rs
+│   ├── identifiers.rs
+│   ├── money.rs
+│   └── token_count.rs
+└── events/
+    ├── mod.rs
+    └── domain_events.rs
+```
+
+This is a logical starting structure. Modules can be adjusted as the implementation evolves.
+
+# 17. Testing Requirements
+
+Domain tests must not require:
+
+- PostgreSQL.
+- Redis.
+- Docker.
+- External LLM providers.
+- Network connectivity.
+
+Required tests include:
+
+1. Tenant and project ownership validation.
+2. API key lifecycle transitions.
+3. Model capability eligibility.
+4. Routing decision invariants.
+5. Budget availability calculations.
+6. Reservation state transitions.
+7. Idempotent settlement.
+8. Ledger immutability.
+9. Execution state transitions.
+10. Provider attempt uniqueness.
+11. Unknown outcome handling.
+12. Cache tenant isolation rules.
+13. Money arithmetic and rounding.
+14. Invalid value-object construction.
+
+Use unit tests and property-based tests for financial and state-transition invariants.
+
+# 18. Definition of Done
 
 The domain model is ready for implementation when:
 
-- [ ] Bounded contexts are documented.
-- [ ] Entities and value objects are defined.
-- [ ] Strongly typed identifiers are established.
-- [ ] Aggregate roots and boundaries are documented.
-- [ ] Tenant ownership rules are explicit.
-- [ ] API key lifecycle is defined.
-- [ ] Provider credentials are separated from virtual API keys.
-- [ ] Rate limits are separated from concurrency limits.
-- [ ] Budgets and reservations have explicit invariants.
-- [ ] Model and provider relationships are defined.
-- [ ] Routing decisions are explainable.
-- [ ] Inference request and execution lifecycles are defined.
-- [ ] Idempotency rules are documented.
-- [ ] Cache isolation rules are explicit.
-- [ ] Usage and audit records are defined.
-- [ ] Domain events are identified.
-- [ ] Domain services are identified.
-- [ ] Infrastructure dependencies remain outside the domain layer.
+- All aggregate roots are identified.
+- Aggregate ownership is unambiguous.
+- Core entities and value objects are defined.
+- State transitions are documented.
+- Financial invariants are explicit.
+- Domain events have stable identities and schemas.
+- Domain types do not depend on infrastructure.
+- Critical invariants have corresponding tests.
+- The domain model maps consistently to the architecture and API contracts.
 
----
+# 19. Related Documents
 
-## 26. Next Document
+- `docs/product.md`
+- `docs/architecture.md`
+- `docs/specification-consistency-review.md`
+- `docs/api-contracts.md`
+- `docs/security.md`
+- `docs/routing-policy.md`
+- `docs/budget-and-usage-accounting.md`
+- `docs/provider-integration.md`
+- `docs/reliability.md`
+- `docs/test-strategy.md`
+- `docs/build-plan.md`
 
-The next specification is `docs/api-contracts.md`.
-
-It will define:
-
-- API conventions and versioning.
-- Authentication headers.
-- Inference endpoints.
-- Streaming endpoints.
-- API key management.
-- Tenant and project administration.
-- Model registry endpoints.
-- Budget and usage endpoints.
-- Rate-limit responses.
-- Error response format.
-- Idempotency behavior.
-- Request and response JSON schemas.
-- OpenAPI contract expectations.
