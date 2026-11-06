@@ -2,7 +2,8 @@ use jsonwebtoken::{EncodingKey, DecodingKey, TokenData, encode, decode, Validati
 use chrono::{Utc, Duration};
 use bioivara_domain::User;
 
-const JWT_SECRET: &[u8; 64] = b"bioviva-jwt-secret-must-be-at-least-32-bytes-secret-key";
+const JWT_SECRET: &[u8] = b"bioviva-jwt-secret-2026-hmac-sha256-key";
+
 const ACCESS_TOKEN_TTL: i64 = 900;  // 15 minutes
 const REFRESH_TOKEN_TTL: i64 = 604800;  // 7 days
 
