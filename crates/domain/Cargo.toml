@@ -1,0 +1,10 @@
+[package]
+name = "bioivara-domain"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# NO external IO or framework dependencies — pure Rust types only
+uuid = "1.0"
+chrono = "0.4"
+thiserror = "1.0"

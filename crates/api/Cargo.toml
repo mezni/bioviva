@@ -1,0 +1,13 @@
+[package]
+name = "bioivara-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bioivara-infrastructure = { path = "../infrastructure" }
+bioivara-application = { path = "../application" }
+bioivara-domain = { path = "../domain" }
+axum = "0.7"
+tokio = { version = "1.38", features = ["full"] }
+tracing-subscriber = "0.3"
+serde = { version = "1.0", features = ["derive"] }
