@@ -165,6 +165,7 @@ name = "bioivara-application"
 version = "0.1.0"
 dependencies = [
  "bioivara-domain",
+ "uuid",
 ]
 
 [[package]]
@@ -183,11 +184,14 @@ dependencies = [
  "argon2",
  "bioivara-application",
  "bioivara-domain",
+ "chrono",
  "jsonwebtoken",
+ "serde",
  "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

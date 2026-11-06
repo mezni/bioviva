@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 bioivara-domain = { path = "../domain" }
+uuid = "1.0"
