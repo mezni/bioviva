@@ -1,0 +1,86 @@
+# BioViva Sprint Status
+# Generated: {date}
+# Project: BioViva
+# Tracking System: file-system
+# Story Location: docs/epics-and-stories.md
+
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+#
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created, ready for development
+#   - in-progress: Developer actively working on implementation
+#   - review: Implementation complete, ready for review
+#   - done: Story completed
+#
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+#
+# Action Item Status:
+#   - open: Committed during a retrospective, not yet addressed
+#   - in-progress: Actively being worked on
+#   - done: Completed
+
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when its first story starts (via build's sprint sync)
+# - Stories can be worked in parallel if team capacity allows
+# - Developer typically creates the next story after the previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+# - Retrospective appends its action items to action_items; the status view surfaces open ones
+
+generated: 11-05-2026 21:45
+last_updated: 11-05-2026 21:45
+project: BioViva
+project_key: BOV
+tracking_system: file-system
+story_location: "docs/epics-and-stories.md"
+
+development_status:
+  # Epic 1: Auth & Identity Bounded Context
+  epic-1: backlog
+  STORY-1.1: ready-for-dev    # User Registration & Password Hashing (Argon2)
+  STORY-1.2: ready-for-dev    # Authentication & JWT Token Issuance
+  STORY-1.3: backlog          # Axum Auth Middleware & RBAC
+
+  # Epic 2: Product Catalog Bounded Context
+  epic-2: backlog
+  STORY-2.1: ready-for-dev    # Domain Models & Value Objects
+  STORY-2.2: backlog          # Product & Variant CRUD Repository
+  STORY-2.3: backlog          # Catalog Query & Filtering API Endpoints
+
+  # Epic 3: Sales & Orders Bounded Context
+  epic-3: backlog
+  STORY-3.1: backlog          # Cart Aggregate & Price Snapshotting
+  STORY-3.2: backlog          # Order State Machine & Checkout Processing
+  STORY-3.3: backlog          # Order Retrieval & Status API Endpoints
+
+  # Epic 4: Inventory & Origin Batch Bounded Context
+  epic-4: backlog
+  STORY-4.1: backlog          # Supplier Batch & Origin Tracking Models
+  STORY-4.2: backlog          # Stock Reservation & Deduction Logic
+
+  # Epic 5: Scaffolding, DevOps & Integration Setup
+  epic-5: backlog
+  STORY-5.1: backlog          # Workspace Cargo & Docker Compose Setup
+  STORY-5.2: backlog          # SQLx Database Migrations Setup
+
+action_items:
+  - epic: 1
+    action: "Finalize UX DESIGN.md and EXPERIENCE.md spines for Auth flow"
+    owner: "UX Designer"
+    status: open
+  - epic: 2
+    action: "Implement PgProductRepo with SQLx parameterized queries"
+    owner: "Senior Dev"
+    status: open
+  - epic: 3
+    action: "Implement checkout transaction with SELECT ... FOR UPDATE for race condition prevention"
+    owner: "Senior Dev"
+    status: open
