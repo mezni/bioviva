@@ -1,8 +1,0 @@
-[package]
-name = "bioivara-application"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-bioivara-domain = { path = "../domain" }
-uuid = "1.0"
